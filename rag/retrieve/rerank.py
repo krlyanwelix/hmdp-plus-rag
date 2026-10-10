@@ -71,16 +71,24 @@ class LexicalReranker(Reranker):
         ]
 
 
+def _resolve_device(device: str | None) -> str | None:
+    """auto/None 交给 sentence-transformers 自己选（有 CUDA 用 GPU），否则原样透传。"""
+    if device in (None, "", "auto"):
+        return None
+    return device
+
+
 class CrossEncoderReranker(Reranker):
     """真实重排模型，推荐 BAAI/bge-reranker-v2-m3。"""
 
     name = "cross-encoder"
 
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str | None = None):
         from sentence_transformers import CrossEncoder  # type: ignore
 
-        self.model = CrossEncoder(model_name)
+        self.model = CrossEncoder(model_name, device=_resolve_device(device))
         self.model_name = model_name
+        self.device = str(getattr(self.model, "device", "?"))
 
     def rerank(self, query: str, hits: list[Hit], top_k: int) -> list[Hit]:
         if not hits:
@@ -106,9 +114,9 @@ def get_reranker(cfg, verbose: bool = True) -> Reranker:
 
     if kind in {"auto", "cross"}:
         try:
-            rr = CrossEncoderReranker(cfg.rerank_model)
+            rr = CrossEncoderReranker(cfg.rerank_model, device=cfg.device)
             if verbose:
-                print(f"[reranker] {rr.model_name}")
+                print(f"[reranker] {rr.model_name} (device={rr.device})")
             return rr
         except Exception as exc:
             if kind == "cross":

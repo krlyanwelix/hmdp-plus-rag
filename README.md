@@ -6,6 +6,9 @@
 设计取向是**每个环节都可插拔、可观测**，而不是堆一个开箱即用的黑盒。
 默认用内置的降级实现跑起来，装上真实组件后自动切换，代码不用改。
 
+> 当前工作区已装好全部真实组件（chromadb + bge-m3 + bge-reranker-v2-m3 + jieba 等），
+> `auto` 会自动使用它们。实测数据与结论见「已验证」章节。
+
 ---
 
 ## 快速开始
@@ -19,7 +22,7 @@ python cli.py eval --compare         # 三模式消融对比
 python cli.py chunks                 # 人工检查切块是否合理
 ```
 
-`data/raw/` 下已放好 6 篇示例文档（虚构的 XR-2000 网关产品资料），
+`data/raw/` 下已放好 7 篇示例文档（虚构的 XR-2000 网关产品资料），
 其中特意包含一篇**上一代 XR-1000 手册作为干扰项**——它们的配置项名称相同但默认值不同，
 用来检验检索能不能区分「相似但错误」的内容。
 
@@ -192,30 +195,82 @@ python cli.py eval --compare
 
 ## 已验证 / 未验证
 
-**已跑通并验证**
-- 全链路 `ingest → search → ask → eval → chunks`
-- 增量索引、父子块展开、`lost-in-the-middle` 重排、引用编号映射
-- 内置 hashing embedder、BM25、RRF、词法重排
-- 评测指标（含对排序敏感的证据 MRR）
-- **`ChromaStore`（真实 chromadb 1.5.9 实跑通过）**
-- **两个向量后端的结果一致性**
+**所有组件均已实跑验证**（chromadb 1.5.9 + sentence-transformers 6.1.0 + torch 2.14 + pypdf + beautifulsoup4 + jieba）：
 
-**实测数据**（20 题，k=5，零依赖降级栈，memory 与 chroma 后端结果完全相同）
+| 组件 | 实现 | 状态 |
+| --- | --- | --- |
+| 解析 .txt/.md/.docx/.pdf/.html | `parse.py` | ✅ 全部实测（含标题/分页锚点提取） |
+| 切块（父子块 + 字符偏移） | `split.py` | ✅ |
+| embedding | `HashingEmbedder` + `SentenceTransformerEmbedder`(bge-m3) | ✅ 都实测 |
+| 向量库 | `MemoryStore` + `ChromaStore`(HNSW) | ✅ 都实测，结果一致 |
+| 关键词检索 | `BM25Index`（jieba 分词生效） | ✅ |
+| 融合 / 重排 | RRF + Noop / Lexical / CrossEncoder(bge-reranker-v2-m3) | ✅ 都实测 |
+| 评测 | recall@k / MRR / NDCG / 证据@1 / 证据MRR | ✅ |
+
+**唯一未验证**：`OpenAIEmbedder` 和 `OpenAICompatLLM`——它们需要的不是 pip 包，而是
+**API key + 一个真实或本地 LLM 服务**，本环境无法凭空验证。配置 `.env` 的 `LLM_API_KEY` 后即可用。
+
+### 实测数据（20 题，k=5，chroma 后端）
+
+**① 完整栈（bge-m3 embedding + bge-reranker 重排）**
 
 ```
-mode        recall@5       证据召回      证据@1     证据MRR     来源MRR    ndcg
-hybrid         0.950      1.000     0.895     0.947     0.900   0.909
+mode          recall@5   证据召回   证据@1   证据MRR   来源MRR   ndcg
+vector/bm25/hybrid   0.950   1.000   1.000   1.000   0.925   0.933   （三模式相同）
 ```
 
-19 道有证据的题里 17 道答案就在第一段，2 道在第二段；1 道负样本不计入。
+**② 纯召回层（`RERANKER=none`，观察召回本身的差异）**
 
-**关于两个后端的一致性：** `MemoryStore` 是精确检索，`ChromaStore` 是 HNSW 近似检索，
-在这个规模（28 条向量）上指标完全一致，说明 ANN 的召回损失可以忽略。
-语料上到几十万条以后两者才可能拉开差距，届时以 Chroma 为准。
+```
+mode        recall@5   证据召回   证据@1   证据MRR   来源MRR   ndcg
+vector         0.908     1.000   0.947   0.974   0.867   0.865
+bm25           0.950     1.000   1.000   1.000   0.900   0.911
+hybrid         0.933     1.000   0.947   0.974   0.875   0.886
+```
 
-**仍未实跑**
-- `SentenceTransformerEmbedder` / `CrossEncoderReranker`（缺 `sentence-transformers`）
-- PDF / HTML 解析分支（缺 `pypdf` / `beautifulsoup4`）
+**③ 降级栈（hashing embedder + 词法重排，作对照）**：证据@1 = 0.895，证据MRR = 0.947。
+
+### 三个结论（都来自实测，后两条反直觉）
+
+1. **cross-encoder 重排带来真实收益**：证据@1 从 0.895 → 1.000、证据MRR 0.947 → 1.000。
+   那两道原本排到第 2 段的题，加真实重排后全部升到第 1 段。
+
+2. **cross-encoder 会把召回差异抹平**：②里三模式差异明显，①里三模式完全相同。
+   重排太强，无论候选来自哪一路召回，都能挑出真正相关的段落。因此
+   「装上语义模型后三模式差异就会显现」是错的——差异只在**关掉重排**时才可见。
+
+3. **BM25 在这个语料上比语义向量强**：②里 bm25 全面领先 vector，hybrid 居中。
+   原因是评测集几乎全是精确术语（型号、错误码、参数名、数字），BM25 词面匹配天然占优，
+   语义向量反而把「语义相似但术语不对」的段落（XR-1000 vs XR-2000 的相似表述）拉了进来。
+   **混合检索不是万能药**，价值取决于查询分布：精确术语多就偏 BM25，口语化/同义改写多就偏语义向量。
+
+### 工程数据
+
+- cross-encoder 重排 20 题（每题 30 候选 × 3 模式）：**CPU 约 10 分钟，GPU（RTX 4060）约 103 秒**。
+- 纯重排推理单次（30 候选，模型已加载）：**GPU 121 ms，CPU 1411 ms，约 11.6 倍**。
+  模型加载本身（读 2.2GB×2 权重到内存/显存）约 40 秒，与设备无关，是单次 search 的大头。
+- 磁盘占用：模型缓存 `.hf_cache` 约 **6.5 GB**，依赖 `.pylibs` 约 **1.3 GB**（CUDA 版 torch 另加约 2.6 GB）。
+- memory（精确）与 chroma（HNSW 近似）在 28 条向量上指标逐位一致，ANN 召回损失为零。
+
+### GPU 重排怎么开
+
+默认 `DEVICE=auto`，装上 CUDA 版 torch 就会自动用 GPU（`stats` 显示 `device: cuda:0`）。三步：
+
+```bash
+# 1) 把 CPU 版 torch 换成 CUDA 版（按需选 cu126 / cu124，对应 CUDA 12.x 驱动）
+pip install --target .pylibs --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+
+# 2) 确认 GPU 可用
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+# 3) 无需改代码，auto 自动走 GPU；也可显式指定
+#    .env: DEVICE=cuda   （或 DEVICE=cpu 强制回退 CPU）
+```
+
+> 注意：CUDA 版 torch 的体积比 CPU 版大得多（本机实测约 2.6 GB），
+> 且必须与 NVIDIA 驱动兼容。本机 RTX 4060 + 驱动 591.59 + torch 2.14.1+cu126 实测通过。
+> 没 NVIDIA 显卡的机器装 CUDA 版 torch 是浪费，保持 CPU 版即可。
+
 
 ---
 
@@ -224,41 +279,53 @@ hybrid         0.950      1.000     0.895     0.947     0.900   0.909
 不想污染共享 Python 运行时的话，装到工作区本地目录：
 
 ```bash
-pip install --target .pylibs chromadb sentence-transformers
+pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4 jieba
 ```
+
+> 上面装的是 CPU 版 torch（sentence-transformers 的默认依赖）。
+> 要 GPU 加速重排，见上文「GPU 重排怎么开」单独换 CUDA 版 torch。
 
 `cli.py` 启动时会自动把 `.pylibs` 追加到 `sys.path`，所以直接
 `python cli.py stats` 就能看到它生效，不需要设 `PYTHONPATH`。
 该目录已在 `.gitignore` 里。
 
+**模型下载走镜像**：`sentence-transformers` 首次运行会从 HuggingFace 下载模型
+（bge-m3 + bge-reranker-v2-m3 约 4.4GB）。官方 `huggingface.co` 不通时，在 `.env` 里设置：
+
+```
+HF_ENDPOINT=https://hf-mirror.com
+HF_HOME=E:\dsh workspace\.hf_cache     # 缓存在工作区内，便于复用
+```
+
 装完 chromadb 后注意：`STORE_BACKEND=auto` 会**自动从 memory 切到 chroma**，
 而新后端的集合是空的。程序会打印明确警告并提示重建，但重建仍然必须由你触发。
 
-### 一个重要的坑：零依赖栈下三种模式分数完全相同
+### 怎么观察「召回层」本身的差异
 
-`eval --compare` 在降级栈上会显示 vector / bm25 / hybrid 三个模式**分数一模一样**。
-这不是 bug——关掉重排后逐题对比 chunk 顺序，三者确实不同。
+重排会把召回差异抹平，所以要看某一路召回到底有没有用，先关掉重排：
 
-原因是：hashing embedder 本质上也是词法模型（字符 n-gram 哈希），
-和 BM25、词法重排属于同一类信号，彼此没有互补性，所以融合后排序趋同，
-再经过同源的重排就完全抹平了。
+```bash
+# Linux / macOS
+RERANKER=none python cli.py eval --compare -k 5
+# Windows PowerShell
+$env:RERANKER="none"; python cli.py eval --compare -k 5
+```
 
-**混合检索的价值只有在两路召回真正异质时才体现。** 换上 `bge-m3`（语义）
-+ BM25（词面）+ `bge-reranker`（交叉注意力）之后，差异才会显现。
+这样三模式的分数才是**召回层**的真实差异（见上文实测数据 ②）。
+不加 `RERANKER=none` 时，看到的是「召回 + 重排」的最终效果（实测数据 ①）。
 
 ---
 
-## 换成生产组件
+## 切换后端 / 模型
+
+依赖装好后 `auto` 会自动切换，无需改代码。但切换后**必须重建索引**：
 
 ```bash
-pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4 jieba
+python cli.py ingest --rebuild
 ```
 
-装完不用改代码，`auto` 会自动切换。然后 `python cli.py ingest --rebuild` 重建索引
-（**必须重建**，向量空间变了），再用 `eval` 对比升级前后的指标。
-
-**换后端或换 embedding 模型后不重建，程序会报警。** 索引目录里存了 `index_meta.json`，
-记录这份索引用什么建的；检测到不一致时 `search` / `eval` / `stats` 都会打印
+**不重建，程序会报警。** 索引目录里存了 `index_meta.json`，记录这份索引用什么后端、
+什么 embedding 模型建的；检测到与当前配置不一致时，`search` / `eval` / `stats` 都会打印
 明确的迁移提示。这个检查**不受 `-q` 影响**——它是正确性问题，不是日志噪音。
 
 `stats` 命令会显示每个环节实际生效的实现：
@@ -267,7 +334,7 @@ pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4
   embedder          : sentence-transformers
   reranker          : cross-encoder
   store             : chroma
-  llm               : openai-compatible
+  llm               : echo
 ```
 
 如果某项显示的还是降级实现，说明对应依赖没装上或导入失败，留意启动时的告警行。

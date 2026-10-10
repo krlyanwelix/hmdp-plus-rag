@@ -102,6 +102,7 @@ class RAGPipeline:
             "parents": self.parents.count(),
             "embedder": self.embedder.name,
             "reranker": self.reranker.name,
+            "device": getattr(self.embedder, "device", None) or getattr(self.reranker, "device", None) or "cpu",
             "store": self.store.backend,
             "llm": self.llm.name,
             "bm25_enabled": self.cfg.use_bm25,

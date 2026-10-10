@@ -90,18 +90,31 @@ class HashingEmbedder(Embedder):
         return _l2norm(out)
 
 
+def _resolve_device(device: str | None) -> str | None:
+    """auto/None 交给 sentence-transformers 自己选（有 CUDA 用 GPU），否则原样透传。"""
+    if device in (None, "", "auto"):
+        return None
+    return device
+
+
 class SentenceTransformerEmbedder(Embedder):
     """真实本地模型，推荐 BAAI/bge-m3（中英混合 + 长文本友好）。"""
 
     name = "sentence-transformers"
 
-    def __init__(self, model_name: str = "BAAI/bge-m3", query_prefix: str = ""):
+    def __init__(self, model_name: str = "BAAI/bge-m3", query_prefix: str = "", device: str | None = None):
         from sentence_transformers import SentenceTransformer  # type: ignore
 
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, device=_resolve_device(device))
         self.model_name = model_name
         self.query_prefix = query_prefix
-        self.dim = int(self.model.get_sentence_embedding_dimension())
+        self.device = str(getattr(self.model, "device", "?"))
+        # ST 6.x 把 get_sentence_embedding_dimension 改名为 get_embedding_dimension，
+        # 这里兼容两个版本
+        if hasattr(self.model, "get_embedding_dimension"):
+            self.dim = int(self.model.get_embedding_dimension())
+        else:  # pragma: no cover - 旧版 ST
+            self.dim = int(self.model.get_sentence_embedding_dimension())
 
     def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
         if is_query and self.query_prefix:
@@ -155,9 +168,9 @@ def get_embedder(cfg, verbose: bool = True) -> Embedder:
 
     if kind in {"auto", "st"}:
         try:
-            emb = SentenceTransformerEmbedder(cfg.embed_model, cfg.embed_query_prefix)
+            emb = SentenceTransformerEmbedder(cfg.embed_model, cfg.embed_query_prefix, device=cfg.device)
             if verbose:
-                print(f"[embedder] {emb.model_name} (dim={emb.dim})")
+                print(f"[embedder] {emb.model_name} (dim={emb.dim}, device={emb.device})")
             return emb
         except Exception as exc:
             if kind == "st":

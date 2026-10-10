@@ -16,3 +16,8 @@ pypdf>=4.0
 beautifulsoup4>=4.12
 # 中文分词（装了会让 BM25 更准，不装则退化为字级 bigram）
 jieba>=0.42
+
+# ---- GPU 加速（可选）----
+# sentence-transformers 默认带 CPU 版 torch。有 NVIDIA GPU 时换成 CUDA 版：
+#     pip install --target .pylibs --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+# 详见 README「GPU 重排怎么开」。

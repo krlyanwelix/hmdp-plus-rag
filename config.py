@@ -88,6 +88,11 @@ class Config:
     reranker: str = _s("RERANKER", "auto")          # auto | cross | lexical | none
     rerank_model: str = _s("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
+    # ---------------- 设备 ----------------
+    # auto: 有 CUDA 就用 GPU，否则 CPU；也可显式设 cuda / cpu。
+    # 注意：要走 GPU 必须装 CUDA 版 torch（不是 +cpu 版），否则只有 CPU。
+    device: str = _s("DEVICE", "auto")              # auto | cuda | cuda:0 | cpu
+
     # ---------------- 向量库 ----------------
     store_backend: str = _s("STORE_BACKEND", "auto")  # auto | memory | chroma
 
