@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/index/
+.pytest_cache/
+# 可选依赖的本地安装目录（见 README）
+.pylibs/
+.piptmp/

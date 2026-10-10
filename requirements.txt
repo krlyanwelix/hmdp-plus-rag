@@ -1,0 +1,18 @@
+# ---- 核心（必需，本环境已内置 numpy） ----
+numpy>=1.24
+
+# ---- 可选：装上即自动启用，无需改代码 ----
+# 推荐装到工作区本地目录，避免污染共享 Python 运行时：
+#     pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4 jieba
+# cli.py 会自动把 .pylibs 加入 sys.path。
+#
+# 真实向量库（替代内置 numpy 暴力检索）—— 已实测通过 chromadb 1.5.9
+chromadb>=0.5
+# 本地 embedding / reranker（BAAI/bge-m3、bge-reranker-v2-m3）
+sentence-transformers>=2.7
+# PDF 解析
+pypdf>=4.0
+# HTML 解析
+beautifulsoup4>=4.12
+# 中文分词（装了会让 BM25 更准，不装则退化为字级 bigram）
+jieba>=0.42

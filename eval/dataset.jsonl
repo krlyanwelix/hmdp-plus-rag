@@ -1,0 +1,20 @@
+{"question": "XR-2000 的最大并发连接数是多少？", "relevant_sources": ["产品手册.md"], "evidence": ["5000"], "gold_answer": "5000"}
+{"question": "E1042 是什么错误，怎么排查？", "relevant_sources": ["产品手册.md", "常见问题.md"], "evidence": ["上游连接超时"], "gold_answer": "上游连接超时；先查上游健康状态与延迟，确认 upstream_timeout 大于上游 P99"}
+{"question": "upstream_timeout 的默认值和单位是什么？", "relevant_sources": ["产品手册.md"], "evidence": ["upstream_timeout", "30"], "gold_answer": "默认 30，单位秒"}
+{"question": "部署 XR-2000 需要哪个版本的 Redis？", "relevant_sources": ["部署指南.md"], "evidence": ["7.0"], "gold_answer": "Redis 7.0 及以上，不再支持 6.x"}
+{"question": "集群部署最少需要几个节点，为什么？", "relevant_sources": ["部署指南.md", "常见问题.md"], "evidence": ["3 个节点"], "gold_answer": "建议 3 个节点，可容忍 1 个节点故障"}
+{"question": "容器管理 API 默认监听哪个端口？", "relevant_sources": ["部署指南.md"], "evidence": ["8080"], "gold_answer": "8080 提供管理 API 与 Web 控制台，9090 提供 Prometheus 指标"}
+{"question": "XR_LICENSE_KEY 和 XR_REDIS_URL 是必填的吗？", "relevant_sources": ["部署指南.md"], "evidence": ["XR_LICENSE_KEY", "XR_REDIS_URL"], "gold_answer": "都是必填，缺失时服务拒绝启动"}
+{"question": "启用 DPI 后并发连接数建议控制在多少？", "relevant_sources": ["产品手册.md", "常见问题.md"], "evidence": ["3000"], "gold_answer": "3000 以内"}
+{"question": "通过 REST API 修改的配置在容器重启后还在吗？", "relevant_sources": ["常见问题.md", "REST API 参考.md"], "evidence": ["重启后会恢复"], "gold_answer": "不在，重启后恢复为配置文件里的值；要持久化需调用 config/commit"}
+{"question": "服务启动时提示 License 无效，可能有哪些原因？", "relevant_sources": ["常见问题.md"], "evidence": ["过期"], "gold_answer": "授权码填错、License 过期、系统时钟偏差超过 24 小时"}
+{"question": "日志默认保留多少天，debug 级别会有什么影响？", "relevant_sources": ["产品手册.md", "常见问题.md"], "evidence": ["30 天"], "gold_answer": "默认 30 天；debug 级别日志体积可能增长 10 倍以上，需缩短保留期"}
+{"question": "XR-2000 工作温度范围是多少？", "relevant_sources": ["产品手册.md"], "evidence": ["-20"], "gold_answer": "-20 ℃ 至 60 ℃，注意 XR-1000 是 0 ℃ 起"}
+{"question": "从 XR-1000 升级到 XR-2000 后，upstream_timeout 的默认值有什么变化？", "relevant_sources": ["XR-1000产品手册（历史版本）.md", "产品手册.md", "版本变更记录.md"], "evidence": ["60", "30"], "gold_answer": "从 60 秒下调为 30 秒"}
+{"question": "XR-2000 的 max_retry 默认值和 XR-1000 分别是多少？", "relevant_sources": ["产品手册.md", "XR-1000产品手册（历史版本）.md"], "evidence": ["max_retry", "5"], "gold_answer": "XR-2000 是 3，XR-1000 是 5"}
+{"question": "启用深度包检测需要额外授权吗？", "relevant_sources": ["产品手册.md", "XR-1000产品手册（历史版本）.md", "版本变更记录.md"], "evidence": ["授权"], "gold_answer": "需要额外授权"}
+{"question": "WireGuard 和 IPsec 在国密算法支持上有什么区别？", "relevant_sources": ["安全白皮书.md"], "evidence": ["国密"], "gold_answer": "WireGuard 不支持 SM 系列算法，需要国密只能选 IPsec"}
+{"question": "审计日志默认保留多少天，可以缩短吗？", "relevant_sources": ["安全白皮书.md"], "evidence": ["180 天"], "gold_answer": "默认 180 天，为满足合规不可通过配置缩短"}
+{"question": "管理 API 的默认限流阈值是多少？", "relevant_sources": ["REST API 参考.md"], "evidence": ["50"], "gold_answer": "每令牌每秒 50 次请求，超出返回 429"}
+{"question": "管理员账号连续输错密码几次会被锁定，锁多久？", "relevant_sources": ["安全白皮书.md"], "evidence": ["15 分钟"], "gold_answer": "连续 5 次错误锁定 15 分钟"}
+{"question": "XT-9000 这个型号支持多少并发连接？", "relevant_sources": [], "evidence": [], "gold_answer": "资料中不存在该型号，应回答无法回答（负样本，测试模型是否会编造）"}
