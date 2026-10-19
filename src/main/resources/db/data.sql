@@ -3,6 +3,9 @@
 -- 时间用相对 NOW() 生成，导入后立刻可以报名，不会因为日期过期而报"已截止"
 -- =====================================================================
 
+-- 同 schema.sql：不写这行，容器里 latin1 默认会让中文变成双重编码
+SET NAMES utf8mb4;
+
 USE `hmdp_plus`;
 
 INSERT INTO `tb_user` (`id`, `phone`, `nick_name`, `icon`)

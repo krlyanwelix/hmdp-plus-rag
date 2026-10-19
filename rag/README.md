@@ -82,15 +82,34 @@ data/sports/*.md          7 篇本届规程 + 1 篇上届历史版本（故意�
 
 ## 3. 快速开始
 
+### 3.0 一条命令（Docker Compose）
+
+```bash
+cp .env.example .env                                  # 填 LLM / embedding / rerank 的 key
+docker compose -f deploy/docker-compose.yml up -d --build
+curl http://127.0.0.1:8090/healthz                    # documents_indexed 应为 26
+```
+
+这一条会起 `rag-app`（FastAPI 8090）、`rag-redis`（6380）、`milvus`（19530）。
+容器启动时先等 Milvus healthy，再检查集合里有没有数据，空的话自动 `ingest` 建索引。
+想强制重建索引：`RAG_INGEST_ON_START=force`。
+
+主链路是仓库根目录的 `deploy/docker-compose.yml`（MySQL/Redis/RocketMQ/Canal/应用），
+两个 compose 互不依赖。
+
+下面的 3.1~3.4 是不用 Docker、直接在 Windows 上跑的手工流程。
+
 ### 3.1 起基础设施（Redis + Milvus）
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
-docker ps                      # redis / milvus 都应是 healthy
+docker compose -f deploy/docker-compose.yml up -d milvus rag-redis
+docker ps                      # milvus / rag-redis 都应是 healthy
 ```
 
 Milvus 官方 compose 要额外挂 etcd 和 MinIO 两个容器；这里用
-`ETCD_USE_EMBED=true` + `COMMON_STORAGETYPE=local` 把它们省掉了，只起两个容器。
+`ETCD_USE_EMBED=true` + `COMMON_STORAGETYPE=local` 把它们省掉了。
+手工跑时把 `.env` 里的 `RAG_MILVUS_URI` 写成 `http://127.0.0.1:19530`、
+`REDIS_URL` 写成 `redis://127.0.0.1:6380/0`。
 
 ### 3.2 装依赖
 

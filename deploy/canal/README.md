@@ -30,22 +30,34 @@ RocketMQ 侧预建 topic（消费者启动时 topic 不存在会空转约 30s）
 mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t canal-binlog-topic
 ```
 
+## 走 Docker Compose 时可以跳过这一节
+
+主链路的 `deploy/docker-compose.yml` 已经把 Canal 容器、两个配置文件、只读账号都接好了：
+
+```
+deploy/canal/canal.properties    -> 容器 conf/canal.properties   （serverMode=rocketMQ，namesrv=namesrv:9876）
+deploy/canal/instance.properties -> 容器 conf/example/instance.properties （master.address=mysql:3306）
+deploy/canal/canal-user.sql      -> MySQL 首次初始化时建 canal 账号
+```
+
+下面这些步骤是**不用 Docker、把 canal.deployer 直接跑在宿主机上**时的手工流程。
+
 ## 2. 装 Canal
 
 下载 [canal.deployer-1.1.7.tar.gz](https://github.com/alibaba/canal/releases/tag/canal-1.1.7)
 解压到任意目录（本机是 `E:\canal`），JDK 用 8。
 
-把本目录的两个文件覆盖进去：
+把本目录的两个**宿主机版**文件覆盖进去（`host-` 前缀是为了和容器版区分）：
 
 | 本目录 | 覆盖到 |
 |---|---|
-| `canal.properties` | `conf/canal.properties` |
-| `instance.properties` | `conf/example/instance.properties` |
+| `host-canal.properties` | `conf/canal.properties` |
+| `host-instance.properties` | `conf/example/instance.properties` |
 
-两个文件里的地址/账号都是默认本地值，换环境时改这几行为主：
+两个文件里的地址/账号指向 `127.0.0.1`，换环境时改这几行为主：
 
-- `canal.properties`：`rocketmq.namesrv.addr`
-- `instance.properties`：`canal.instance.master.address`、`dbUsername`、`dbPassword`、`filter.regex`、`canal.mq.topic`
+- `host-canal.properties`：`rocketmq.namesrv.addr`
+- `host-instance.properties`：`canal.instance.master.address`、`dbUsername`、`dbPassword`、`filter.regex`、`canal.mq.topic`
 
 ## 3. 起停与排错
 

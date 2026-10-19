@@ -4,6 +4,12 @@
 -- 字符集统一 utf8mb4，金额以"分"存 BIGINT，时间统一 DATETIME
 -- =====================================================================
 
+-- 强制客户端连接使用 utf8mb4。
+-- 不写这一行时，在 POSIX/C locale 的容器里 mysql 客户端默认可能按 latin1 解释
+-- 本文件的 UTF-8 字节，导入后中文变成"é‡Žå¾„"这种双重编码（docker 首次初始化
+-- 数据卷时踩过）。
+SET NAMES utf8mb4;
+
 CREATE DATABASE IF NOT EXISTS `hmdp_plus` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 USE `hmdp_plus`;
 

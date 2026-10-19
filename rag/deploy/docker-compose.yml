@@ -1,25 +1,33 @@
-# 赛事助手（RAG）与报名系统共用的基础设施
+# 野径 · 赛事助手（RAG）—— 第二条命令
 #
-#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f rag/deploy/docker-compose.yml up -d --build
+#   docker compose -f rag/deploy/docker-compose.yml logs -f rag-app
 #
-# 起完之后的端口：
-#   6379  Redis   —— Java 侧登录态/名额余量，Python 侧答案缓存与限流
-#   19530 Milvus  —— 向量库（.env 里 RAG_MILVUS_URI=http://127.0.0.1:19530）
-#   9091  Milvus 指标端口
+# 三个容器：
+#   rag-app    FastAPI 检索问答服务   8090
+#   rag-redis  助手自己的 Redis       6380   （答案缓存 + 令牌桶限流，和主链路分开）
+#   milvus     向量库（嵌入式 etcd + 本地存储）19530 / 9091
 #
-# 只在本机开发用：Redis 没设密码，Milvus 用嵌入式 etcd + 本地存储，单机单副本。
-# 注意 Milvus 官方 compose 默认要挂 etcd 和 MinIO 两个容器，这里用
-# ETCD_USE_EMBED=true + COMMON_STORAGETYPE=local 把它们去掉了，少两个镜像。
+# 与主链路的关系：主链路容器通过 host.docker.internal:8090 调它；助手挂了只影响问答，
+# 报名与支付不受影响（Java 侧 RagClient 会降级）。
+#
+# 第一次启动会调 embedding API 把 8 篇语料建成索引（约 20~40 秒）；
+# 之后索引在 Milvus 数据卷里，重启不重建。想强制重建：RAG_INGEST_ON_START=force。
+#
+# 密钥等配置来自 rag/.env（不进 git）：cp .env.example .env 后填 key。
+
+name: yejing-rag
 
 services:
-  redis:
+  rag-redis:
     image: redis:latest
-    container_name: redis
-    ports:
-      - "6379:6379"
+    container_name: yejing-rag-redis
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${RAG_REDIS_HOST_PORT:-6380}:6379"
     volumes:
-      - redis_data:/data
+      - rag_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -28,18 +36,21 @@ services:
 
   milvus:
     image: milvusdb/milvus:v2.5.4
-    container_name: milvus
+    container_name: yejing-rag-milvus
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
     environment:
+      TZ: Asia/Shanghai
+      # 官方 standalone 要另起 etcd + MinIO，这里用嵌入式 etcd + 本地存储省掉两个容器
       ETCD_USE_EMBED: "true"
       ETCD_DATA_DIR: /var/lib/milvus/etcd
       ETCD_CONFIG_PATH: /milvus/configs/advanced/etcd.yaml
       COMMON_STORAGETYPE: local
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      - "${MILVUS_HOST_PORT:-19530}:19530"
+      - "${MILVUS_METRICS_HOST_PORT:-9091}:9091"
     volumes:
       - milvus_data:/var/lib/milvus
     healthcheck:
@@ -49,6 +60,39 @@ services:
       retries: 20
       start_period: 60s
 
+  rag-app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: yejing/rag:local
+    container_name: yejing-rag-app
+    restart: unless-stopped
+    # rag/.env 里有 LLM / embedding / rerank 的 key；缺失时不阻塞启动（required: false）
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      TZ: Asia/Shanghai
+      RAG_HOST: 0.0.0.0
+      RAG_PORT: "8090"
+      # 容器内用服务名寻址，覆盖 .env 里的 127.0.0.1
+      STORE_BACKEND: milvus
+      RAG_MILVUS_URI: http://milvus:19530
+      MILVUS_COLLECTION: rag_chunks
+      MILVUS_METRIC: COSINE
+      REDIS_URL: redis://rag-redis:6379/0
+      RAG_CACHE_ENABLED: "true"
+      RAG_SHARED_SECRET: ${RAG_SHARED_SECRET:-yejing-rag-2026-local-dev}
+      RAG_INGEST_ON_START: ${RAG_INGEST_ON_START:-1}
+      MILVUS_HEALTH_URL: http://milvus:9091/healthz
+    ports:
+      - "${RAG_HOST_PORT:-8090}:8090"
+    depends_on:
+      rag-redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+
 volumes:
-  redis_data:
+  rag_redis_data:
   milvus_data:

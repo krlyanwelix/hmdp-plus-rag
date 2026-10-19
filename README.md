@@ -120,7 +120,45 @@ hmdp-plus-rag
 
 ## 三、跑起来
 
-### 前置
+### 方式 A · 两条命令（Docker Compose，推荐）
+
+```bash
+# 第一条：主链路（MySQL + Redis + RocketMQ + Canal + 应用）
+docker compose -f deploy/docker-compose.yml up -d --build
+
+# 第二条：赛事助手（Redis + Milvus + FastAPI）
+docker compose -f rag/deploy/docker-compose.yml up -d --build
+```
+
+| 命令 | 起什么 | 端口 |
+|---|---|---|
+| 主链路 | `app` / `mysql` / `redis` / `namesrv` / `broker` / `canal` | 8081 / 3306 / 6379 / 9876 / 10911 / 11111 |
+| 助手 | `rag-app` / `rag-redis` / `milvus` | 8090 / 6380 / 19530 |
+
+两个 compose 彼此独立：助手挂了只影响问答，报名支付照常（Java 侧会降级）。
+
+几个要点：
+
+- **MySQL 首次启动会自动建库**：`schema.sql`、`data.sql`、Canal 只读账号三份脚本挂在
+  `/docker-entrypoint-initdb.d/`，只在数据卷为空时执行。想推倒重来：
+  `docker compose -f deploy/docker-compose.yml down -v`。
+- **端口被本机已装的服务占用**时，`cp deploy/.env.example deploy/.env` 改端口再起。
+- **应用镜像吃的是本地打好的 jar**，改过 Java 代码要先 `mvn -o -q -DskipTests package`，
+  再 `up -d --build`。
+- **助手首次启动会调 embedding API 建索引**（8 篇 → 26 个子块，20~40 秒）；索引存在 Milvus
+  数据卷里，之后重启不重建。要强制重建：`RAG_INGEST_ON_START=force`。
+- 助手需要 `rag/.env` 里的 key（DeepSeek / 硅基流动），没有文件也能起，只是问答会降级。
+
+验证：
+
+```bash
+curl http://127.0.0.1:8081/event/list        # 主链路
+curl http://127.0.0.1:8090/healthz           # 助手（documents_indexed 应为 26）
+```
+
+### 方式 B · 手工起（本机已装好中间件时）
+
+#### 前置
 
 | 组件 | 版本 | 必需 |
 |---|---|---|
@@ -131,7 +169,7 @@ hmdp-plus-rag
 | Canal | 1.1.7 | 否（缺省时退化为"只删本地缓存"，跨实例失效失效；配置见下文「缓存失效链路」） |
 | OpenResty | 1.21+ | 否（不启动也能直连 8081 压测应用层） |
 
-### 步骤
+#### 步骤
 
 ```bash
 # 1. 建库 + 演示数据（注意显式指定 utf8mb4，否则中文会乱码成 ??）

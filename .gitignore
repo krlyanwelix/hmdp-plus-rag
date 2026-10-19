@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Docker Compose 本地配置（含密码，别提交；模板见 deploy/.env.example） ###
+deploy/.env

@@ -1,0 +1,168 @@
+# 野径 · 城市路跑赛事报名 —— 主链路（一条命令起全套）
+#
+#   mvn -o -q -DskipTests package          # 第一次或改过 Java 代码后
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml logs -f app
+#
+# 起来的六个容器：
+#   app      Spring Boot 应用       8081
+#   mysql    MySQL 8.0              3306   （首次启动自动建库 + 导入 schema/data）
+#   redis    Redis                  6379   （登录态、名额余量、缓存）
+#   namesrv  RocketMQ NameServer    9876
+#   broker   RocketMQ Broker        10911 / 10909
+#   canal    Canal Server           11111  （binlog -> cache:event:{id} 失效）
+#
+# 旁边的赛事助手是另一条命令：
+#   docker compose -f rag/deploy/docker-compose.yml up -d
+#
+# 端口被本机已装的服务占用时，改下面的环境变量即可（见 deploy/.env.example）：
+#   $env:MYSQL_HOST_PORT=3307; docker compose ... up -d
+#
+# 想清空数据重来：docker compose -f deploy/docker-compose.yml down -v
+
+name: yejing-main
+
+services:
+  # ---------------------------------------------------------------- 存储
+  mysql:
+    image: mysql:8.0
+    container_name: yejing-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-wp123456}
+      MYSQL_DATABASE: hmdp_plus
+      TZ: Asia/Shanghai
+    ports:
+      - "${MYSQL_HOST_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 只在数据卷为空时执行：建表 -> 演示数据 -> Canal 只读账号
+      - ../src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ../src/main/resources/db/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro
+      - ./canal/canal-user.sql:/docker-entrypoint-initdb.d/03-canal-user.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:latest
+    container_name: yejing-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------- RocketMQ
+  namesrv:
+    image: apache/rocketmq:4.9.7
+    container_name: yejing-namesrv
+    restart: unless-stopped
+    command: sh mqnamesrv
+    ports:
+      - "${NAMESRV_HOST_PORT:-9876}:9876"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9876'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  broker:
+    image: apache/rocketmq:4.9.7
+    container_name: yejing-broker
+    restart: unless-stopped
+    command: sh mqbroker -n namesrv:9876 -c /home/rocketmq/rocketmq-4.9.7/conf/broker.conf
+    environment:
+      NAMESRV_ADDR: namesrv:9876
+      JAVA_OPT_EXT: "-server -Xms512m -Xmx512m -Xmn256m"
+    ports:
+      - "${BROKER_HOST_PORT:-10911}:10911"
+      - "${BROKER_HA_HOST_PORT:-10909}:10909"
+    volumes:
+      # 注意路径：镜像里 ROCKETMQ_HOME=/home/rocketmq/rocketmq-4.9.7，
+      # -c 指到这个位置；挂到 /home/rocketmq/conf 下 broker 会起不来
+      - ./rocketmq/broker.conf:/home/rocketmq/rocketmq-4.9.7/conf/broker.conf:ro
+      # 没有把 store 挂成命名卷：命名卷首次创建时是 root:root，
+      # broker 以 rocketmq 用户跑，写不进去会直接 exit 253。
+      # 开发环境消息本来就可以随容器丢弃，重启后用 Canal/对账任务自行收敛。
+    depends_on:
+      namesrv:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/10911'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # ---------------------------------------------------------------- binlog 失效
+  canal:
+    image: canal/canal-server:latest
+    container_name: yejing-canal
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${CANAL_HOST_PORT:-11111}:11111"
+    volumes:
+      - ./canal/canal.properties:/home/admin/canal-server/conf/canal.properties:ro
+      - ./canal/instance.properties:/home/admin/canal-server/conf/example/instance.properties:ro
+      - canal_logs:/home/admin/canal-server/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- 应用
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.app
+    image: yejing/app:local
+    container_name: yejing-app
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: hmdp_plus
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-wp123456}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      ROCKETMQ_NAME_SERVER: namesrv:9876
+      # 赛事助手在另一条 compose 里，从容器看宿主机要 host.docker.internal
+      RAG_BASE_URL: ${RAG_BASE_URL:-http://host.docker.internal:8090}
+      RAG_SHARED_SECRET: ${RAG_SHARED_SECRET:-yejing-rag-2026-local-dev}
+    ports:
+      - "${APP_HOST_PORT:-8081}:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      canal:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  redis_data:
+  canal_logs:

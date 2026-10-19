@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.local
+.pylibs
+.hf_cache
+__pycache__/
+**/__pycache__/
+*.pyc
+data/index
+data/milvus.db
+data/milvus.db.lock
+logs
+eval/runs
+.pytest_cache

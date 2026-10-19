@@ -1,0 +1,14 @@
+# 主链路镜像的构建上下文是仓库根目录（deploy/Dockerfile.app 只 COPY target 下的 jar），
+# 这里把体积大且用不到的东西挡掉，避免每次 build 都把 1GB+ 的 .pylibs 传给 docker。
+.git
+.idea
+.vscode
+**/target/classes
+**/target/test-classes
+rag/.pylibs
+rag/.env
+rag/data/index
+rag/data/milvus.db
+rag/**/__pycache__
+rag/.hf_cache
+docs
