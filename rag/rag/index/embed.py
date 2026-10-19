@@ -1,0 +1,243 @@
+"""向量化层。
+
+原理：embedding 把文本映射到高维空间，让语义相近的文本距离近。
+相似度用余弦（向量归一化后等价于点积）。
+
+一个必须记住的坑：**相似 != 相关**。
+查询是「问题」，文档是「陈述」，字面不同但语义相关（非对称检索）。
+BGE 系列训练时用了非对称前缀，查询端必须手动加上，否则明显掉召回。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import time
+import urllib.error
+import urllib.request
+from abc import ABC, abstractmethod
+
+import numpy as np
+
+_CJK = r"\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af"
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+_CJK_RUN_RE = re.compile(f"[{_CJK}]+")
+
+
+def _l2norm(mat: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(mat, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    return (mat / norm).astype(np.float32)
+
+
+def tokenize_for_embedding(text: str) -> list[str]:
+    """英文按词，中日韩按「单字 + 相邻字 bigram」。
+
+    中文没有空格，单字信息量太低、整句又太稀疏，bigram 是最省事的折中
+    （装 jieba 后可换成真实分词，见 README 扩展点）。
+    """
+    text = text.lower()
+    tokens = _WORD_RE.findall(text)
+    for run in _CJK_RUN_RE.findall(text):
+        tokens.extend(run)
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+def _hash_slot(token: str, dim: int) -> tuple[int, float]:
+    """哈希到 [0, dim) 并给一个 ±1 符号，符号哈希能抵消部分碰撞偏差。"""
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+    v = int.from_bytes(digest, "little")
+    return v % dim, (1.0 if (v >> 63) & 1 else -1.0)
+
+
+class Embedder(ABC):
+    """统一接口：encode 返回已 L2 归一化的 (n, dim) float32 矩阵。"""
+
+    name: str = "base"
+    dim: int = 0
+
+    @abstractmethod
+    def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
+        raise NotImplementedError
+
+    def encode_one(self, text: str, is_query: bool = False) -> np.ndarray:
+        return self.encode([text], is_query=is_query)[0]
+
+
+class HashingEmbedder(Embedder):
+    """零依赖降级方案：特征哈希 + 子线性 TF。
+
+    质量明显不如真实 embedding 模型，但胜在离线可用、确定性、无需下载，
+    足以验证「切块 / 混合检索 / 重排 / 引用」这些管线环节是否正确。
+    生产环境请务必换成真实模型。
+    """
+
+    name = "hashing"
+
+    def __init__(self, dim: int = 1024):
+        self.dim = dim
+
+    def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
+        out = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for i, text in enumerate(texts):
+            counts: dict[str, int] = {}
+            for tok in tokenize_for_embedding(text):
+                counts[tok] = counts.get(tok, 0) + 1
+            for tok, c in counts.items():
+                idx, sign = _hash_slot(tok, self.dim)
+                out[i, idx] += sign * (1.0 + math.log(c))  # 子线性 TF，抑制高频词
+        return _l2norm(out)
+
+
+def _resolve_device(device: str | None) -> str | None:
+    """auto/None 交给 sentence-transformers 自己选（有 CUDA 用 GPU），否则原样透传。"""
+    if device in (None, "", "auto"):
+        return None
+    return device
+
+
+class SentenceTransformerEmbedder(Embedder):
+    """真实本地模型，推荐 BAAI/bge-m3（中英混合 + 长文本友好）。"""
+
+    name = "sentence-transformers"
+
+    def __init__(self, model_name: str = "BAAI/bge-m3", query_prefix: str = "", device: str | None = None):
+        from sentence_transformers import SentenceTransformer  # type: ignore
+
+        self.model = SentenceTransformer(model_name, device=_resolve_device(device))
+        self.model_name = model_name
+        self.query_prefix = query_prefix
+        self.device = str(getattr(self.model, "device", "?"))
+        # ST 6.x 把 get_sentence_embedding_dimension 改名为 get_embedding_dimension，
+        # 这里兼容两个版本
+        if hasattr(self.model, "get_embedding_dimension"):
+            self.dim = int(self.model.get_embedding_dimension())
+        else:  # pragma: no cover - 旧版 ST
+            self.dim = int(self.model.get_sentence_embedding_dimension())
+
+    def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
+        if is_query and self.query_prefix:
+            texts = [self.query_prefix + t for t in texts]
+        vecs = self.model.encode(
+            texts,
+            batch_size=32,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(vecs, dtype=np.float32)
+
+
+class OpenAIEmbedder(Embedder):
+    """走 OpenAI 兼容的 /v1/embeddings 接口（OpenRouter、硅基流动、通义等都兼容）。
+
+    免费/低价模型常有严格限流，因此内置 429 重试 + 退避：
+    优先读响应里的 Retry-After，否则按 retry_delay * 2^n 指数退避。
+    """
+
+    name = "openai"
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: int = 60,
+        dim: int = 1024,
+        retries: int = 6,
+        retry_delay: float = 2.0,
+        query_prefix: str = "",
+    ):
+        if not api_key:
+            raise ValueError("OpenAIEmbedder 需要 API key")
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.dim = dim
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self.query_prefix = query_prefix
+
+    def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
+        # BGE 系列是非对称检索模型，查询端需要前缀（与本地 SentenceTransformerEmbedder 一致）
+        if is_query and self.query_prefix:
+            texts = [self.query_prefix + t for t in texts]
+        payload = json.dumps({"model": self.model, "input": texts}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        body = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/embeddings", data=payload, headers=headers, method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < self.retries:
+                    delay = self._retry_after(exc, attempt)
+                    print(
+                        f"    [embedder] 429 限流，{delay:.1f}s 后重试（第 {attempt + 1} 次）", flush=True
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+        assert body is not None  # 走到这里说明成功返回
+        rows = sorted(body["data"], key=lambda d: d.get("index", 0))
+        mat = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
+        self.dim = mat.shape[1]
+        return _l2norm(mat)
+
+    @staticmethod
+    def _retry_after(exc: urllib.error.HTTPError, attempt: int) -> float:
+        ra = (exc.headers or {}).get("Retry-After")
+        if ra:
+            try:
+                return max(0.0, float(ra))
+            except (ValueError, TypeError):
+                pass
+        return 2.0 * (2 ** attempt)  # 指数退避
+
+
+def get_embedder(cfg, verbose: bool = True) -> Embedder:
+    """工厂：按配置选择实现，auto 时优先真实模型、失败则降级。"""
+    kind = (cfg.embedder or "auto").lower()
+
+    if kind in {"auto", "st"}:
+        try:
+            emb = SentenceTransformerEmbedder(cfg.embed_model, cfg.embed_query_prefix, device=cfg.device)
+            if verbose:
+                print(f"[embedder] {emb.model_name} (dim={emb.dim}, device={emb.device})")
+            return emb
+        except Exception as exc:
+            if kind == "st":
+                raise
+            if verbose:
+                print(f"[embedder] sentence-transformers 不可用（{type(exc).__name__}），"
+                      f"降级为内置 hashing embedder")
+                print("           提示：pip install sentence-transformers 可显著提升检索质量")
+
+    if kind == "openai":
+        base_url = cfg.embed_base_url or cfg.llm_base_url
+        api_key = cfg.embed_api_key or cfg.llm_api_key
+        if verbose:
+            print(f"[embedder] OpenAI 兼容 /embeddings：model={cfg.embed_model} @ {base_url}")
+        return OpenAIEmbedder(
+            model=cfg.embed_model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=cfg.llm_timeout,
+            dim=cfg.embed_dim,
+            query_prefix=cfg.embed_query_prefix,
+        )
+
+    return HashingEmbedder(dim=cfg.embed_dim)

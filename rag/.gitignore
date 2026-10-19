@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 本地依赖目录 ----
+# 用 pip install --target .pylibs 装的 cp312 二进制，体积几百 MB，不入库
+.pylibs/
+.piptmp/
+
+# ---- 环境变量 ----
+# 真实 key 只留在本地；仓库里只放 .env.example
+.env
+
+# ---- 索引产物 ----
+# 由 python cli.py ingest 生成，随时可重建
+data/index/
+data/*.db/
+data/milvus.db/
+
+# ---- 模型缓存 ----
+# 曾经误把 HF 模型缓存提交进历史，已从历史中移除
+.hf_cache/
+HF_HOME/
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
