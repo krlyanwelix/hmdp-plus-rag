@@ -87,6 +87,10 @@ services:
       MILVUS_HEALTH_URL: http://milvus:9091/healthz
     ports:
       - "${RAG_HOST_PORT:-8090}:8090"
+    volumes:
+      # 父块（small-to-big 用的 parents.json）在文件系统上，不在向量库里；
+      # 不持久化的话容器重建后会悄悄退化成“只用子块”。
+      - rag_index_data:/app/data/index
     depends_on:
       rag-redis:
         condition: service_healthy
@@ -96,3 +100,4 @@ services:
 volumes:
   rag_redis_data:
   milvus_data:
+  rag_index_data:
