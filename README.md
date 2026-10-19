@@ -128,7 +128,7 @@ hmdp-plus-rag
 | MySQL | 5.7 / 8.0 | 是 |
 | Redis | 5.0+ | 是 |
 | RocketMQ | 4.9.x（NameServer + Broker） | 是（事务消息/延迟消息） |
-| Canal | 1.1.7 | 否（缺省时退化为"只删本地缓存"，跨实例失效失效） |
+| Canal | 1.1.7 | 否（缺省时退化为"只删本地缓存"，跨实例失效失效；配置见下文「缓存失效链路」） |
 | OpenResty | 1.21+ | 否（不启动也能直连 8081 压测应用层） |
 
 ### 步骤
@@ -161,6 +161,53 @@ listenPort=10911
 autoCreateTopicEnable=true
 autoCreateSubscriptionGroup=true
 ```
+
+### 缓存失效链路（Canal → RocketMQ → 应用）
+
+应用自己写库后会主动删缓存，这条链路解决的是**绕过应用的写**：DBA 手工改库、别的服务改同一张表、
+以及多实例部署时**别的实例**的 Caffeine（JVM 内，只有广播能碰到）。
+
+```
+MySQL ROW binlog ─► Canal Server（rocketMQ 模式、flatMessage）─► topic canal-binlog-topic
+                                                                        │
+                                          CanalCacheEvictConsumer ◄──────┘
+                                                    │
+                                  cache:event:{id} / cache:eventGroup:{eventId} 失效
+```
+
+前置条件（缺一不可，都验证过）：
+
+1. MySQL 开 `log_bin=ON`、`binlog_format=ROW`、`binlog_row_image=FULL`；
+2. 一个只有读+复制权限的账号：
+   `GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'canal'@'%';`
+3. Kafka/RocketMQ 侧 topic 已存在（`mqadmin updateTopic ... -t canal-binlog-topic`）。
+
+Canal 1.1.7 的关键配置（`conf/canal.properties` 与 `conf/example/instance.properties`）：
+
+```properties
+# canal.properties：走 MQ 而不是 tcp，且必须是平铺 JSON（消费者按 table/data 解析）
+canal.serverMode = rocketMQ
+rocketmq.namesrv.addr = 127.0.0.1:9876
+rocketmq.producer.group = canal-producer
+canal.mq.flatMessage = true
+```
+
+```properties
+# instance.properties
+canal.instance.master.address=127.0.0.1:3306
+canal.instance.dbUsername=canal
+canal.instance.dbPassword=canal123
+# 只订阅会被改的两张表；报名单改动频繁且不缓存，进这条链路只是浪费
+canal.instance.filter.regex=hmdp_plus\\.tb_event,hmdp_plus\\.tb_event_group
+canal.mq.topic=canal-binlog-topic
+```
+
+启动：`bin/startup.bat`（Windows）/ `bin/startup.sh`（Linux），日志在 `logs/example/example.log`，
+启动成功的标志是 `start successful....` 与 `the next step is binlog dump`。
+
+> 两个容易卡住的点：`canal.serverMode` 忘了从 `tcp` 改成 `rocketMQ` 时，binlog 解析一切正常但
+> **一条消息都不会发**；`canal.mq.flatMessage` 关掉则发的是 protobuf 扁平包，消费者按
+> `{"table":..,"data":[..]}` 解析会拿到 null 并静默跳过。
 
 关键配置都在 `src/main/resources/application.yaml`：
 
@@ -209,7 +256,9 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 ## 五、已知限制
 
 1. **支付是假的**：`pay` 只做状态流转，没有对接支付渠道，也没有异步回调与对账。
-2. **Canal 链路未联调**：消费者代码就绪，但没接真实 Canal Server；单机部署时"写后删缓存"已够用。
+2. **Canal 只在单机上验证过**：本机跑的是 canal.deployer 1.1.7（JVM 进程，非容器），
+   `canal.properties` 用 file 模式持久化位点。多实例/multi-destination、HA 与位点重置都未验证；
+   单机部署且"写后删缓存"已生效时，这条链路属于兜底而非必需。
 3. **对账是单机串行**：Redisson 锁保证只有一个实例在跑，代价是数据量大时一轮扫不完；
    生产上应按 event_id 分片并发。
 4. **没有压测数据**：本机没有 JMeter 环境的跑分一律不写进 README，避免出现无法复现的数字。
@@ -248,6 +297,8 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 | 6 | 重复报名 | 持有效单时再报同一赛事 | 返回「您在本赛事已有报名，请勿重复提交」（Lua 第 2 步 `SISMEMBER` 拦截） |
 | 7 | DB/Redis 对账 | 对账任务跑完一轮后比对 | DB `quota=2999` = Redis `2999` = `initial_quota 3000 − 1 张有效单` |
 | 8 | 滑动窗口限流 | 1 秒内对 `/registration/**` 连打 6 次 | 第 6 次返回「操作过于频繁，请稍后再试」 |
+| 9 | Canal 失效赛事缓存 | 先 `GET /event/2` 热缓存，再 `UPDATE tb_event SET venue=... WHERE id=2`（**绕过应用**） | `cache:event:2` 在 **318ms** 后被删，再次 GET 返回新值；不重启、不改应用代码 |
+| 10 | Canal 失效组别列表 | 同样先热 `GET /event/2/groups`，再直接改 `tb_event_group.name` | `cache:eventGroup:2` 在 **256ms** 后失效，组别名立即更新（余量仍走 Redis 实时读） |
 
 ---
 
