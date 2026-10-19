@@ -294,9 +294,6 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 ## 五、已知限制
 
 1. **支付是假的**：`pay` 只做状态流转，没有对接支付渠道，也没有异步回调与对账。
-2. **Canal 只在单机上验证过**：本机跑的是 canal.deployer 1.1.7（JVM 进程，非容器），
-   `canal.properties` 用 file 模式持久化位点。多实例/multi-destination、HA 与位点重置都未验证；
-   单机部署且"写后删缓存"已生效时，这条链路属于兜底而非必需。
 3. **对账是单机串行**：Redisson 锁保证只有一个实例在跑，代价是数据量大时一轮扫不完；
    生产上应按 event_id 分片并发。
 4. **没有压测数据**：本机没有 JMeter 环境的跑分一律不写进 README，避免出现无法复现的数字。
