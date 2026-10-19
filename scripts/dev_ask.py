@@ -28,6 +28,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / ".pylibs"))
 sys.path.insert(0, str(ROOT))
 
+# Windows 控制台默认 GBK，答案里有 ⚠ 之类的符号会直接 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 from config import Config  # noqa: F401,E402  作用：加载 .env 到 os.environ
 
 SECRET = os.getenv("RAG_SHARED_SECRET", "")
