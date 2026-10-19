@@ -14,6 +14,8 @@ import hashlib
 import json
 import math
 import re
+import time
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 
@@ -130,36 +132,80 @@ class SentenceTransformerEmbedder(Embedder):
 
 
 class OpenAIEmbedder(Embedder):
-    """走 OpenAI 兼容的 /v1/embeddings 接口（DeepSeek、通义、vLLM 等都兼容）。"""
+    """走 OpenAI 兼容的 /v1/embeddings 接口（OpenRouter、硅基流动、通义等都兼容）。
+
+    免费/低价模型常有严格限流，因此内置 429 重试 + 退避：
+    优先读响应里的 Retry-After，否则按 retry_delay * 2^n 指数退避。
+    """
 
     name = "openai"
 
-    def __init__(self, model: str, base_url: str, api_key: str, timeout: int = 60, dim: int = 1024):
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: int = 60,
+        dim: int = 1024,
+        retries: int = 6,
+        retry_delay: float = 2.0,
+        query_prefix: str = "",
+    ):
         if not api_key:
-            raise ValueError("OpenAIEmbedder 需要 LLM_API_KEY / OPENAI_API_KEY")
+            raise ValueError("OpenAIEmbedder 需要 API key")
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.dim = dim
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self.query_prefix = query_prefix
 
     def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
+        # BGE 系列是非对称检索模型，查询端需要前缀（与本地 SentenceTransformerEmbedder 一致）
+        if is_query and self.query_prefix:
+            texts = [self.query_prefix + t for t in texts]
         payload = json.dumps({"model": self.model, "input": texts}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/embeddings",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        body = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/embeddings", data=payload, headers=headers, method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < self.retries:
+                    delay = self._retry_after(exc, attempt)
+                    print(
+                        f"    [embedder] 429 限流，{delay:.1f}s 后重试（第 {attempt + 1} 次）", flush=True
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+        assert body is not None  # 走到这里说明成功返回
         rows = sorted(body["data"], key=lambda d: d.get("index", 0))
         mat = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
         self.dim = mat.shape[1]
         return _l2norm(mat)
+
+    @staticmethod
+    def _retry_after(exc: urllib.error.HTTPError, attempt: int) -> float:
+        ra = (exc.headers or {}).get("Retry-After")
+        if ra:
+            try:
+                return max(0.0, float(ra))
+            except (ValueError, TypeError):
+                pass
+        return 2.0 * (2 ** attempt)  # 指数退避
 
 
 def get_embedder(cfg, verbose: bool = True) -> Embedder:
@@ -181,12 +227,17 @@ def get_embedder(cfg, verbose: bool = True) -> Embedder:
                 print("           提示：pip install sentence-transformers 可显著提升检索质量")
 
     if kind == "openai":
+        base_url = cfg.embed_base_url or cfg.llm_base_url
+        api_key = cfg.embed_api_key or cfg.llm_api_key
+        if verbose:
+            print(f"[embedder] OpenAI 兼容 /embeddings：model={cfg.embed_model} @ {base_url}")
         return OpenAIEmbedder(
             model=cfg.embed_model,
-            base_url=cfg.llm_base_url,
-            api_key=cfg.llm_api_key,
+            base_url=base_url,
+            api_key=api_key,
             timeout=cfg.llm_timeout,
             dim=cfg.embed_dim,
+            query_prefix=cfg.embed_query_prefix,
         )
 
     return HashingEmbedder(dim=cfg.embed_dim)

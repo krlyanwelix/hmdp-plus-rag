@@ -1,23 +1,36 @@
-# ---- 核心（必需，本环境已内置 numpy） ----
+# 装到项目内的本地目录，避免污染共享运行时：
+#     pip install --target .pylibs -r requirements.txt
+# cli.py 与 service/run.py 都会自动把 .pylibs 加进 sys.path。
+#
+# 注意：.pylibs 里的二进制是 cp312 的，必须用 Python 3.12 运行（Python 3.13/3.14 会报
+# _multiarray_umath.cp312_win_amd64.pyd incompatible）。
+
+# ---- 核心 ----
 numpy>=1.24
 
-# ---- 可选：装上即自动启用，无需改代码 ----
-# 推荐装到工作区本地目录，避免污染共享 Python 运行时：
-#     pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4 jieba
-# cli.py 会自动把 .pylibs 加入 sys.path。
-#
-# 真实向量库（替代内置 numpy 暴力检索）—— 已实测通过 chromadb 1.5.9
-chromadb>=0.5
-# 本地 embedding / reranker（BAAI/bge-m3、bge-reranker-v2-m3）
-sentence-transformers>=2.7
-# PDF 解析
+# ---- HTTP 服务 ----
+fastapi==0.115.6
+starlette==0.41.3
+uvicorn>=0.30
+
+# ---- 向量库 ----
+# 连独立 Milvus（deploy/docker-compose.yml）
+pymilvus>=2.4
+# 备选：单文件嵌入式库（不装 pymilvus 时 auto 会降级到这里）
+# chromadb>=0.5
+
+# ---- 缓存与限流 ----
+redis>=5.0
+cryptography>=42
+
+# ---- 文档解析 ----
 pypdf>=4.0
-# HTML 解析
 beautifulsoup4>=4.12
-# 中文分词（装了会让 BM25 更准，不装则退化为字级 bigram）
+# 中文分词：装了 BM25 更准，不装则退化为字级 bigram
 jieba>=0.42
 
-# ---- GPU 加速（可选）----
-# sentence-transformers 默认带 CPU 版 torch。有 NVIDIA GPU 时换成 CUDA 版：
+# ---- 本地 embedding / 重排（可选） ----
+# 默认全 API 模式不需要；想跑本地 bge-m3 / bge-reranker-v2-m3 时再装，会拉 torch（约 4GB）：
+#     pip install --target .pylibs sentence-transformers
+# 有 NVIDIA GPU 时换成 CUDA 版 torch：
 #     pip install --target .pylibs --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
-# 详见 README「GPU 重排怎么开」。

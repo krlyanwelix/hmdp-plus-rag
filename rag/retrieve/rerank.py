@@ -11,6 +11,10 @@ Bi-Encoder vs Cross-Encoder 的本质区别：
 
 from __future__ import annotations
 
+import json
+import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 
 from rag.retrieve.bm25 import BM25Index
@@ -107,10 +111,109 @@ class CrossEncoderReranker(Reranker):
         ]
 
 
+class APIReranker(Reranker):
+    """走 /rerank 接口的重排器（硅基流动、Cohere 风格，非 OpenAI /embeddings 格式）。
+
+    请求：POST {base_url}/rerank
+      {"model": ..., "query": ..., "documents": [...], "top_n": N}
+    响应：{"results": [{"index": i, "relevance_score": s}, ...]}
+
+    与 embedding 不同，/rerank 是 query 与 documents 交互打分（一次网络往返搞定整个候选集）。
+    内置 429 重试 + 退避，与 OpenAIEmbedder 一致。
+    """
+
+    name = "api-reranker"
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: int = 60,
+        retries: int = 6,
+        retry_delay: float = 2.0,
+    ):
+        if not api_key:
+            raise ValueError("APIReranker 需要 API key")
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self.device = "api"
+
+    def rerank(self, query: str, hits: list[Hit], top_k: int) -> list[Hit]:
+        if not hits:
+            return []
+
+        payload = json.dumps(
+            {
+                "model": self.model,
+                "query": query,
+                "documents": [h.text for h in hits],
+                "top_n": min(top_k, len(hits)),
+            }
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+
+        body = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/rerank", data=payload, headers=headers, method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < self.retries:
+                    delay = self._retry_after(exc, attempt)
+                    print(f"    [reranker] 429 限流，{delay:.1f}s 后重试", flush=True)
+                    time.sleep(delay)
+                    continue
+                raise
+
+        assert body is not None
+        scored = {r["index"]: float(r["relevance_score"]) for r in body["results"]}
+        ordered = sorted(scored, key=lambda i: -scored[i])
+        return [
+            Hit(
+                chunk_id=hits[idx].chunk_id,
+                score=scored[idx],
+                text=hits[idx].text,
+                metadata={**hits[idx].metadata, "rrf_score": hits[idx].score},
+            )
+            for idx in ordered[:top_k]
+        ]
+
+    @staticmethod
+    def _retry_after(exc: urllib.error.HTTPError, attempt: int) -> float:
+        ra = (exc.headers or {}).get("Retry-After")
+        if ra:
+            try:
+                return max(0.0, float(ra))
+            except (ValueError, TypeError):
+                pass
+        return 2.0 * (2 ** attempt)
+
+
 def get_reranker(cfg, verbose: bool = True) -> Reranker:
     kind = (cfg.reranker or "auto").lower()
     if kind == "none":
         return NoopReranker()
+
+    if kind == "api":
+        base_url = cfg.rerank_base_url or cfg.embed_base_url or cfg.llm_base_url
+        api_key = cfg.rerank_api_key or cfg.embed_api_key or cfg.llm_api_key
+        if verbose:
+            print(f"[reranker] API /rerank：model={cfg.rerank_model} @ {base_url}")
+        return APIReranker(
+            model=cfg.rerank_model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=cfg.llm_timeout,
+        )
 
     if kind in {"auto", "cross"}:
         try:

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from config import Config
@@ -18,6 +19,17 @@ from rag.ingest.parse import load_dir
 from rag.ingest.split import split_documents
 
 EMBED_BATCH = 64
+_EVENT_RE = re.compile(r"^e(\d+)[-_]", re.IGNORECASE)
+
+
+def event_id_of(source: str) -> int | None:
+    """从文件名前缀解析赛事 id，如 "E1-竞赛规程.md" -> 1。
+
+    重建索引时把 event_id 写进 metadata，检索就能用 where 在**向量库层面**过滤，
+    而不是先取回 top_k 再丢一半。文件名是唯一可靠的来源标识（parse 层不改文档内容）。
+    """
+    m = _EVENT_RE.match(Path(source).name)
+    return int(m.group(1)) if m else None
 
 
 class Indexer:
@@ -78,6 +90,7 @@ class Indexer:
             batch = children[start : start + EMBED_BATCH]
             vecs = self.embedder.encode([c.text for c in batch], is_query=False)
             for chunk, vec in zip(batch, vecs):
+                event_id = event_id_of(chunk.source)
                 records.append(
                     {
                         "id": chunk.chunk_id,
@@ -86,6 +99,7 @@ class Indexer:
                         "metadata": {
                             "source": chunk.source,
                             "doc_id": chunk.doc_id,
+                            **({"event_id": event_id} if event_id is not None else {}),
                             **chunk.metadata,
                         },
                     }
@@ -117,6 +131,15 @@ class Indexer:
             children=stats["children"],
             parents=stats["parents"],
         )
+
+        # 索引变了，跨实例缓存必须整体失效：版本号一升，旧 key 自然再也查不到，
+        # 不用去扫/删成千上万个 key（Redis 里没有按前缀批量删的低成本方案）。
+        try:
+            from rag.cache import AnswerCache
+
+            AnswerCache.from_env().bump_version()
+        except Exception as exc:  # 缓存不是正确性依赖，失败只记日志
+            self._log(f"  [cache] 版本号更新失败（不影响检索）：{exc}")
 
         self._log(
             f"  完成：向量库 {stats['store_total']} 条（{stats['store']}）"

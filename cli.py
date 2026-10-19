@@ -104,8 +104,32 @@ def cmd_ask(args) -> int:
         f" -> 融合 {dbg.get('fused', 0)} -> 重排保留 {dbg.get('reranked', 0)}"
         f" -> 上下文 {dbg.get('contexts', 0)} 段"
     )
-    if dbg.get("citations"):
-        print(f"[引用来源] {', '.join(dbg['citations'])}")
+
+    # 引用溯源校验（确定性部分）
+    check = dbg.get("citation_check") or {}
+    if check:
+        n_mark = check.get("total_markers", 0)
+        cited = check.get("cited") or []
+        print(f"[引用] 标记 {n_mark} 处，覆盖 {len(cited)} 个来源：{', '.join(cited) or '无'}")
+        if check.get("out_of_range"):
+            print(f"  [!] 越界引用编号：{check['out_of_range']}（模型编造了不存在的来源，属硬错误）")
+        if check.get("uncited_lines"):
+            print(f"  [提示] {len(check['uncited_lines'])} 行疑似无引用（过渡/总结句可忽略）：")
+            for line in check["uncited_lines"][:3]:
+                print(f"        · {line}")
+
+    # token 成本
+    usage = dbg.get("usage") or {}
+    if usage:
+        pt = usage.get("prompt_tokens", 0)
+        ct = usage.get("completion_tokens", 0)
+        tt = usage.get("total_tokens", pt + ct)
+        print(f"[Token] 输入 {pt} + 输出 {ct} = {tt}")
+        cost_in = Config().llm_price_input
+        cost_out = Config().llm_price_output
+        if cost_in or cost_out:
+            est = pt / 1e6 * cost_in + ct / 1e6 * cost_out
+            print(f"[成本] 约 {est:.6f}（按 输入 {cost_in}/M、输出 {cost_out}/M 估算）")
     return 0
 
 

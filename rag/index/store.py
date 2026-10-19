@@ -1,8 +1,9 @@
 """向量库。
 
-两个后端，同一接口，配置项 STORE_BACKEND 切换：
+三个后端，同一接口，配置项 STORE_BACKEND 切换：
+    milvus  Milvus / milvus-lite —— 标量过滤下推 + 显式索引参数，默认
+    chroma  Chroma PersistentClient + HNSW —— 单进程独占，作为退路保留
     memory  numpy 矩阵暴力检索 —— 精确、零依赖、几万条以内够用
-    chroma  Chroma PersistentClient + HNSW —— 近似检索，可扩展
 
 为什么 ANN 是「近似」的：HNSW 用分层图把查询复杂度降到约 O(log n)，
 代价是会漏掉少量真正相关的项。所以召回时 top_k 要开大，精度交给重排。
@@ -20,6 +21,14 @@ import numpy as np
 from rag.types import Hit
 
 
+def _match_meta(meta: dict[str, Any], where: dict[str, Any]) -> bool:
+    """等值匹配。dict 里的每个键都要命中，缺键视为不匹配。"""
+    for key, value in where.items():
+        if meta.get(key) != value:
+            return False
+    return True
+
+
 class VectorStore(ABC):
     """只存「参与检索的子块」。父块由 ParentStore 单独管理（见 parents.py）。"""
 
@@ -30,8 +39,12 @@ class VectorStore(ABC):
         """records: [{id, text, embedding: list[float], metadata: dict}]"""
 
     @abstractmethod
-    def search(self, query_vec: np.ndarray, top_k: int) -> list[Hit]:
-        ...
+    def search(self, query_vec: np.ndarray, top_k: int, where: dict | None = None) -> list[Hit]:
+        """where：按 metadata 精确匹配（等值），在**召回阶段**生效。
+
+        和「取回 top_k 再过滤」的区别：过滤下沉到索引层后，top_k 的名额不会
+        被其他赛事/其他用户的数据占满，这是多租户隔离必须做对的一点。
+        """
 
     @abstractmethod
     def get(self, ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -147,20 +160,30 @@ class MemoryStore(VectorStore):
                 f.unlink()
 
     # ---- 读 ----
-    def search(self, query_vec: np.ndarray, top_k: int) -> list[Hit]:
+    def search(self, query_vec: np.ndarray, top_k: int, where: dict | None = None) -> list[Hit]:
         if self._mat is None or not self._ids:
             return []
         q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
         sims = self._mat @ q  # 已归一化，点积即余弦
-        k = min(top_k, len(self._ids))
+        if where:
+            keep = np.asarray(
+                [i for i, m in enumerate(self._metas) if _match_meta(m, where)], dtype=np.int64
+            )
+            if keep.size == 0:
+                return []
+            sims = sims[keep]
+            index_of = lambda pos: int(keep[pos])  # noqa: E731
+        else:
+            index_of = lambda pos: int(pos)  # noqa: E731
+        k = min(top_k, len(sims))
         order = np.argpartition(-sims, k - 1)[:k]
         order = order[np.argsort(-sims[order])]
         return [
             Hit(
-                chunk_id=self._ids[i],
+                chunk_id=self._ids[index_of(i)],
                 score=float(sims[i]),
-                text=self._texts[i],
-                metadata=self._metas[i],
+                text=self._texts[index_of(i)],
+                metadata=self._metas[index_of(i)],
             )
             for i in order
         ]
@@ -240,7 +263,7 @@ class ChromaStore(VectorStore):
             metadatas=[r.get("metadata", {}) for r in records],
         )
 
-    def search(self, query_vec: np.ndarray, top_k: int) -> list[Hit]:
+    def search(self, query_vec: np.ndarray, top_k: int, where: dict | None = None) -> list[Hit]:
         n = self.count()
         if not n:
             return []
@@ -249,6 +272,7 @@ class ChromaStore(VectorStore):
             query_embeddings=[list(map(float, q))],
             n_results=min(top_k, n),
             include=["documents", "metadatas", "distances"],
+            where=where or None,
         )
         ids = (res.get("ids") or [[]])[0]
         docs = (res.get("documents") or [[]])[0]
@@ -319,8 +343,33 @@ class ChromaStore(VectorStore):
 
 
 def get_store(cfg, verbose: bool = True) -> VectorStore:
-    """工厂：auto 时优先 Chroma，不可用则退回 numpy 后端。"""
+    """工厂：auto 时按 milvus → chroma → numpy 的顺序挑第一个可用的。
+
+    顺序是有意的：milvus 同时覆盖「本地嵌入式」和「独立集群」两种部署，
+    换 URI 就能从单机长到集群，不需要改业务代码；chroma 退居第二只是因为
+    它单进程独占，多副本会抢锁。
+    """
     kind = (cfg.store_backend or "auto").lower()
+
+    if kind in {"auto", "milvus"}:
+        try:
+            from rag.index.milvus_store import MilvusStore
+
+            store = MilvusStore(
+                uri=getattr(cfg, "milvus_uri", "data/milvus.db"),
+                collection=getattr(cfg, "milvus_collection", "rag_chunks"),
+                metric=getattr(cfg, "milvus_metric", "COSINE"),
+            )
+            if verbose:
+                print(
+                    f"[store] milvus ({store.metric}) @ {store.uri} 集合={store.collection}"
+                )
+            return store
+        except Exception as exc:
+            if kind == "milvus":
+                raise
+            if verbose:
+                print(f"[store] milvus 不可用（{type(exc).__name__}: {exc}），继续尝试 chroma")
 
     if kind in {"auto", "chroma"}:
         try:

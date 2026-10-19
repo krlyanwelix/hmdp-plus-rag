@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from rag.index.embed import Embedder
 from rag.index.parents import ParentStore
-from rag.index.store import VectorStore
+from rag.index.store import VectorStore, _match_meta
 from rag.retrieve.bm25 import BM25Index
 from rag.retrieve.fusion import rrf
 from rag.retrieve.rerank import Reranker, get_reranker
@@ -55,8 +55,17 @@ class Retriever:
         mode: str = "hybrid",
         top_k: int | None = None,
         debug: dict | None = None,
+        source_prefix: str | None = None,
+        where: dict | None = None,
     ) -> list[Hit]:
-        """返回重排后的子块命中，用于查看「到底检索到了什么」。"""
+        """返回重排后的子块命中，用于查看「到底检索到了什么」。
+
+        where：metadata 等值过滤，**下沉到向量库**，例如 {"event_id": 1}。
+        这样多租户隔离时 top_k 名额不会被别的赛事占满。
+
+        source_prefix：只保留 source 以该前缀开头的块，是 where 的粗粒度替代品，
+        保留给老调用方（CLI/评测）。跨赛事过滤请优先用 where。
+        """
         mode = mode if mode in MODES else "hybrid"
         top_k = top_k or self.cfg.top_k_final
         rankings: list[list[str]] = []
@@ -66,7 +75,7 @@ class Retriever:
         # 向量召回放 rankings[0]，BM25 放后面，等价于给向量略高的先验权重
         if mode in {"hybrid", "vector"}:
             qv = self.embedder.encode_one(question, is_query=True)
-            vec_hits = self.store.search(qv, self.cfg.top_k_recall)
+            vec_hits = self.store.search(qv, self.cfg.top_k_recall, where=where)
             for h in vec_hits:
                 hits[h.chunk_id] = h
             if vec_hits:
@@ -97,6 +106,18 @@ class Retriever:
             if cid in hits
         ]
 
+        if where or source_prefix:
+            candidates = [
+                c
+                for c in candidates
+                if (not where or _match_meta(c.metadata, where))
+                and (
+                    not source_prefix
+                    or str(c.metadata.get("source", "")).startswith(source_prefix)
+                )
+            ]
+            stats["filtered"] = len(candidates)
+
         top = self.reranker.rerank(question, candidates, top_k)
         if debug is not None:
             debug.update({**stats, "reranked": len(top)})
@@ -110,8 +131,21 @@ class Retriever:
         question: str,
         mode: str = "hybrid",
         debug: dict | None = None,
+        source_prefix: str | None = None,
+        top_k: int | None = None,
+        where: dict | None = None,
     ) -> list[Context]:
-        top = self.search(question, mode=mode, debug=debug)
+        # 带过滤条件时要先放大候选，否则过滤完可能一个都不剩
+        if (source_prefix or where) and top_k is None:
+            top_k = max(self.cfg.top_k_final * 3, self.cfg.top_k_final)
+        top = self.search(
+            question,
+            mode=mode,
+            debug=debug,
+            source_prefix=source_prefix,
+            top_k=top_k,
+            where=where,
+        )
 
         # small-to-big：命中子块 -> 取回父块，同一父块只保留最佳得分
         parent_order: list[str] = []

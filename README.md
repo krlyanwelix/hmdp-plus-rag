@@ -1,372 +1,326 @@
-# 纯 Python RAG 骨架
+# 野径 · 赛事助手（RAG 检索与问答服务）
 
-一套**零依赖即可跑通**的 RAG 骨架：解析 → 切块 → 向量化 → 混合检索 → 重排 → 生成 → 引用溯源，
-外加一个能给出可比较数字的检索评测。
+城市路跑 / 越野赛事报名系统里的「赛事助手」：选手在报名前问规程问题（几点关门、要带什么装备、
+半马还有没有名额、退赛怎么退），它基于**赛事方真实发布的规程文档**回答，并给出可点开的引用来源。
 
-设计取向是**每个环节都可插拔、可观测**，而不是堆一个开箱即用的黑盒。
-默认用内置的降级实现跑起来，装上真实组件后自动切换，代码不用改。
+这个仓库是**检索与问答服务**（Python）。报名主链路（名额预占、报名单状态机、名额对账、鉴权）
+在另一个仓库的 Spring Boot 服务里，两者通过 HTTP 对接：
 
-> 当前工作区已装好全部真实组件（chromadb + bge-m3 + bge-reranker-v2-m3 + jieba 等），
-> `auto` 会自动使用它们。实测数据与结论见「已验证」章节。
+```
+  浏览器 ──► Spring Boot 报名服务 ──HTTP──► 本服务（RAG）
+                │  /assistant/ask          /v1/ask
+                │  /assistant/ask/stream   /v1/ask/stream
+                ▼
+           MySQL / Redis / RocketMQ
+```
+
+**职责边界（很重要）**：问的是"规则"才走这里；问的是"我报名成功了吗 / 还有几个名额"这类
+**结构化事实**，由 Java 侧查库后以 `userFacts` 注入，或者干脆不进这里 —— 见
+[为什么私有数据不进向量库](#为什么私有数据不进向量库)。
 
 ---
 
-## 快速开始
+## 1. 它解决什么问题
+
+报名系统的咨询量集中在少数几十个问题上，而答案全在组委会那几份 PDF / Markdown 规程里。
+直接接大模型会编（"大概 6 小时关门吧"），人工客服又答不过来。所以这里做三件事：
+
+1. **只依据给定文档回答**，每句结论后面带 `[1]` 这样的来源编号，前端能点开原文；
+2. **检索不到就明说没收录**，不猜；
+3. **挂了不影响报名**：本服务超时或报错时，Java 侧 600ms 内降级成"助手暂时不可用，
+   报名与支付不受影响"，主链路照常。
+
+---
+
+## 2. 架构
+
+### 2.1 离线：建索引
+
+```
+data/sports/*.md          7 篇本届规程 + 1 篇上届历史版本（故意的干扰项）
+      │
+      ├─ parse      按 Markdown 标题树解析，保留章节路径
+      ├─ split      父块 1500 字（喂给 LLM 的上下文单元）
+      │             子块 500 字 / overlap 80（真正参与检索的最小单元）
+      │             切分时记录字符偏移，子块继承父块的「真实章节标题」
+      ├─ embed      bge-m3（API，非对称检索，查询端加前缀）
+      └─ store      Milvus（collection=rag_chunks，COSINE）
+                    标量列：source / parent_id / event_id
+```
+
+**父子块（small-to-big）**：用小子块去匹配问题（精度高），命中后把它的父块整段喂给模型
+（上下文完整）。父块本身不进向量库 —— 进了只会稀释检索结果。
+
+### 2.2 在线：一次提问
+
+```
+问题 ──► 赛事过滤 where={event_id:N} ──► 双路召回（各 30 条）
+                                          ├─ 向量：bge-m3 + COSINE
+                                          └─ BM25：中文分词 + 术语精确匹配
+                                                    │
+                                              RRF 融合（k=60）
+                                                    │
+                                          cross-encoder 重排（API）
+                                                    │
+                                       取父块 + lost-in-the-middle 重排
+                                                    │
+                                  prompt：强制 [n] 引用 + 只能答文档内 + 拒答约束
+                                                    │
+                                          LLM（deepseek）→ 引用校验
+```
+
+四条工程约束（都在代码里，不是文档承诺）：
+
+| 约束 | 做法 |
+|---|---|
+| 赛事隔离 | `where={"event_id": n}` 下沉到向量库，在 ANN 阶段过滤，不让别的赛事占满 top_k |
+| 用户隔离 | userId 只从 HMAC 签名头取；私有数据以 `userFacts` 注入 prompt，**不进向量库** |
+| 缓存 | Redis，key 含 `event_id`/`userId`/语料版本号，`userScoped` 载荷 TTL 60s 且加密 |
+| 降级 | 检索空 → 固定拒答；生成挂 → 摊开检索原文；全挂 → 仍返回可展示结果，永不 5xx |
+
+---
+
+## 3. 快速开始
+
+### 3.1 起基础设施（Redis + Milvus）
 
 ```bash
-# 只依赖 numpy，本环境已内置
-python cli.py ingest                 # 建索引
-python cli.py search "E1042 是什么"   # 只看检索结果（调检索时最常用）
-python cli.py ask "E1042 是什么"      # 完整问答
-python cli.py eval --compare         # 三模式消融对比
-python cli.py chunks                 # 人工检查切块是否合理
+docker compose -f deploy/docker-compose.yml up -d
+docker ps                      # redis / milvus 都应是 healthy
 ```
 
-`data/raw/` 下已放好 7 篇示例文档（虚构的 XR-2000 网关产品资料），
-其中特意包含一篇**上一代 XR-1000 手册作为干扰项**——它们的配置项名称相同但默认值不同，
-用来检验检索能不能区分「相似但错误」的内容。
+Milvus 官方 compose 要额外挂 etcd 和 MinIO 两个容器；这里用
+`ETCD_USE_EMBED=true` + `COMMON_STORAGETYPE=local` 把它们省掉了，只起两个容器。
 
-想接真实 LLM 生成答案：
+### 3.2 装依赖
+
+`.pylibs` 里是 **cp312 二进制**，必须用 Python 3.12（3.13/3.14 会报
+`_multiarray_umath.cp312_win_amd64.pyd incompatible`）。
 
 ```bash
-cp .env.example .env      # 然后填 LLM_API_KEY
+E:\Python312\python.exe -m pip install --target .pylibs -r requirements.txt
+cp .env.example .env        # 填 EMBED_API_KEY / RERANK_API_KEY / LLM_API_KEY
 ```
 
-不配也能跑，此时 `ask` 会退化成「只展示检索到的原文」——这正是调检索时想要的行为。
-
----
-
-## 架构
-
-两条链路，唯一耦合点是向量库：
-
-```
-【离线索引】 python cli.py ingest
-  文档 → 解析 → 切块(父/子) → 向量化 → 向量库
-                        └────────────→ 父块存储
-
-【在线查询】 python cli.py ask
-  问题 ─→ 向量召回 ─┐
-                    ├→ RRF 融合 → 重排 → 取回父块 → prompt → LLM → 引用
-  问题 ─→ BM25 召回 ─┘
-```
-
-### 目录
-
-```
-config.py                    所有可调参数集中在这里
-cli.py                       命令行入口
-rag/
-  types.py                   Document / Chunk / Hit / Context / Answer
-  ingest/
-    parse.py                 多格式解析 + 结构锚点（标题、页码）
-    split.py                 递归切分 + 父子块，返回字符偏移
-  index/
-    embed.py                 Embedder 工厂（hashing / sentence-transformers / openai）
-    store.py                 向量库工厂（memory 暴力检索 / chroma HNSW）
-    parents.py               父块存储（只按 id 取回，不进向量库）
-  retrieve/
-    bm25.py                  BM25 倒排索引（可选 jieba 分词）
-    fusion.py                RRF 融合
-    rerank.py                Reranker（none / lexical / cross-encoder）
-    retriever.py             检索编排
-  generate/
-    prompt.py                上下文组装 + lost-in-the-middle 重排 + 引用解析
-    llm.py                   OpenAI 兼容客户端（urllib，无第三方依赖）
-  indexer.py                 离线链路编排
-  pipeline.py                在线链路编排（门面）
-  eval/metrics.py            检索层评测指标
-data/raw/                    示例语料
-eval/dataset.jsonl           评测集（20 题，含 1 个负样本）
-```
-
-### 几个刻意的设计决定
-
-**父块不进向量库。** 父块只按 id 取回、从不参与相似度计算，
-放进向量库等于浪费向量维度和检索时间。单独用 JSON 存，逻辑也更清楚。
-
-**切分函数返回字符偏移。** 这样才能给每个**子块**标注它真正所属的章节，
-而不是让它继承父块的章节。早期版本偷懒继承父块标题，结果 1500 字的父块里
-所有子块都显示同一个标题，引用溯源直接失效。
-
-**BM25 每次启动重建。** 语料不大时重建很快，省掉一套索引持久化和失效逻辑。
-语料上规模后再改成落盘。
-
----
-
-## 命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `ingest [--rebuild] [--raw DIR]` | 建索引。默认增量（按 source 先删后加），`--rebuild` 全量重建 |
-| `stats` | 查看索引数量与各组件实际生效的实现 |
-| `search "问题" [--mode M] [-k N] [--full]` | 只检索不生成 |
-| `ask "问题" [--mode M] [--show-context]` | 完整问答 |
-| `eval [--compare] [-k N] [--fail-under X]` | 跑评测；`--compare` 对比 vector/bm25/hybrid |
-| `chunks [--limit N]` | 打印切块结果，人工检查粒度 |
-
-`--mode` 可选 `hybrid`（默认）/ `vector` / `bm25`。全局 `-q` 可放在子命令前后任一位置。
-
-**换 embedding 模型后必须 `--rebuild`**，因为新旧向量不在同一个语义空间，混在一起检索会失真。
-
----
-
-## 配置
-
-全部通过环境变量或 `.env` 覆盖，见 `.env.example`。
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `EMBEDDER` | auto | auto / st / hashing / openai |
-| `EMBED_MODEL` | BAAI/bge-m3 | 本地 embedding 模型 |
-| `EMBED_QUERY_PREFIX` | BGE 中文前缀 | **非对称检索前缀，删掉会明显掉召回** |
-| `STORE_BACKEND` | auto | auto / memory / chroma |
-| `RERANKER` | auto | auto / cross / lexical / none |
-| `PARENT_SIZE` | 1500 | 父块目标字数（喂给 LLM 的单元） |
-| `CHUNK_SIZE` | 500 | 子块目标字数（检索单元） |
-| `CHUNK_OVERLAP` | 80 | 子块重叠字数 |
-| `TOP_K_RECALL` | 30 | 每路召回的宽度 |
-| `TOP_K_FINAL` | 5 | 重排后保留数 |
-| `USE_BM25` | true | 混合检索开关 |
-| `RRF_K` | 60 | RRF 平滑常数 |
-| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | DeepSeek | 任何 OpenAI 兼容服务 |
-
----
-
-## 调优工作流
-
-**不要凭感觉调。** 这个骨架给了你两条腿走路：`search` 看单题，`eval` 看整体。
+### 3.3 建索引 + 起服务
 
 ```bash
-# 1. 先建基线
-python cli.py eval --mode hybrid -k 5
-
-# 2. 改一个参数，重跑，看「证据MRR」变了没有
-python cli.py eval --mode hybrid -k 5
-
-# 3. 怀疑某一路召回没用，做消融
-python cli.py eval --compare
+E:\Python312\python.exe cli.py ingest --rebuild    # 8 篇 → 26 子块 / 10 父块
+E:\Python312\python.exe service\run.py             # 8090
 ```
 
-按症状定位：
+### 3.4 问一句
 
-| 症状 | 最可能的原因 | 对策 |
-| --- | --- | --- |
-| 完全找不到相关文档 | 切块太碎 / 没开 BM25 | 加大 `CHUNK_SIZE`、确认 `USE_BM25=true` |
-| 找到了但排在后面 | 缺重排 / 缺查询前缀 | 上 cross-encoder、确认 `EMBED_QUERY_PREFIX` |
-| 型号、错误码搜不到 | 纯向量的固有盲区 | 必须开混合检索（BM25） |
-| 答案答非所问 | 上下文污染 | 调小 `TOP_K_FINAL` |
-| 答案像编的 | 无溯源约束 | 见 `rag/generate/prompt.py` 的 system prompt |
-| 文档更新后答旧内容 | 索引未更新 | 重跑 `ingest`（增量） |
-
-**一次只改一个变量。** 同时改 `CHUNK_SIZE` 和 `TOP_K_RECALL`，你无法知道是哪个起了作用。
+```bash
+E:\Python312\python.exe cli.py ask "50公里组需要带头灯吗，几副电池"
+E:\Python312\python.exe scripts\dev_ask.py --event 2 --user 1 "关门时间是几点"
+```
 
 ---
 
-## 评测怎么读
+## 4. 目录
 
-`eval` 同时给出五个指标，因为它们回答的是不同问题：
+```
+rag/                     检索内核（与 HTTP 无关，可单独当库用）
+├─ ingest/               解析 + 父子块切分
+├─ index/                embed / store（memory|chroma|milvus）/ parents / meta
+├─ retrieve/             bm25 / fusion(RRF) / rerank / retriever
+├─ generate/             prompt / llm（含流式）
+├─ eval/                 metrics（6 个指标 + 负样本）
+├─ cache.py              Redis 答案缓存（AES-GCM 加密 + 版本号失效）
+├─ ratelimit.py          Redis 令牌桶（fail-open）
+├─ pipeline.py           ask / stream 编排
+└─ indexer.py            建索引流程
 
-| 指标 | 回答的问题 |
-| --- | --- |
-| `recall@k` | 正确的**来源文件**进前 k 了吗 |
-| `证据召回` | 答案**所在的那段话**进来了吗（不看排名） |
-| `证据@1` | 答案就在**第一段**吗 |
-| `证据MRR` | 答案平均排在第几段 |
-| `来源MRR` / `ndcg` | 正确来源排得够不够靠前 |
+service/                 HTTP 层
+├─ api.py                /v1/ask、/v1/ask/stream、/healthz、/v1/stats
+├─ security.py           HMAC-SHA256 验签（60s 时间窗）
+└─ run.py                先注入 .pylibs 再起 uvicorn
 
-**为什么不能只看 `recall@k`：** 语料小的时候它会饱和。
-本骨架的示例语料里，`TOP_K_FINAL=5` 已经覆盖了相当比例的父块，来源级 recall 很容易接近 1.0，
-数字好看但没有区分度。所以要盯 **`证据MRR`** 和 **`证据@1`**——它们对排序敏感。
+scripts/                 调试与验收脚本
+data/sports/             语料（8 篇，含 1 篇上届历史版本作干扰）
+eval/dataset-sports.jsonl  评测集（28 题，26 题带证据要点 + 2 题负样本）
+deploy/docker-compose.yml   Redis + Milvus
+```
 
-标注格式（`eval/dataset.jsonl`，每行一个 JSON）：
+---
+
+## 5. 命令行
+
+```bash
+python cli.py ingest [--rebuild]    # 建索引（--rebuild 全量重建并 bump 缓存版本号）
+python cli.py stats                 # 索引与组件状态
+python cli.py search "问题"          # 只检索不生成（调检索时最常用）
+python cli.py ask "问题"             # 完整问答 + 引用校验 + token 成本
+python cli.py eval --compare        # 三种检索模式各跑一遍，看消融
+python cli.py chunks                # 看切块结果（调 chunk_size 时用）
+```
+
+`ask` 会额外打印引用校验结果：`越界引用`（模型编了不存在的编号，硬错误）和
+`疑似无引用的行`（过渡句可忽略）。
+
+---
+
+## 6. 服务接口
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /healthz` | 索引条数、组件后端（store / cache / rateLimit）、错误信息 |
+| `POST /v1/ask` | 非流式问答，返回 `answer` + `citations[]` + `degraded` + `refused` + `cached` |
+| `POST /v1/ask/stream` | SSE 流式：先 `meta`（检索结果），再 `delta`（增量文本），最后 `done` |
+| `GET /v1/stats` | pipeline / cache / rateLimit 三块统计 |
+
+请求体：
 
 ```json
-{"question": "...", "relevant_sources": ["a.md"], "evidence": ["5000"], "gold_answer": "5000"}
+{"question": "50公里组需要带头灯吗", "eventId": 2, "topK": 5, "useCache": true,
+ "mode": "hybrid", "userFacts": ["你已报名 E2-50公里组，状态=待支付"]}
 ```
 
-- `evidence`：必须**同时**出现在同一个检索上下文里的要点字符串。
-  标注时挑真正能定位答案的短串（型号、参数值、专有名词），别用「的」「是」这种到处都有的词。
-- `relevant_sources` 留空、`evidence` 也留空 = **负样本**，用于测生成端幻觉，不计入检索指标。
+**内部鉴权**：Java 侧对 `"{user}\n{ts}\n" + sha256(body)` 做 HMAC-SHA256，放进
+`X-Rag-User` / `X-Rag-Ts` / `X-Rag-Sign` 三个头。服务端校验 60s 时间窗
+（`hmac.compare_digest` 比较）。没配 `RAG_SHARED_SECRET` 时退化为本机调试模式。
 
-`--fail-under X` 会在证据MRR 低于 X 时返回退出码 1，可以挂进 CI。
+**错误语义**（Java 侧据此决定文案）：
+
+| 情况 | 返回 |
+|---|---|
+| 签名错 / 缺签名 | `401`，Java 侧当"助手不可用" |
+| 超过限流 | `429` + `Retry-After`，`refused=true` 但 `degraded=false`（限流不是故障） |
+| 检索无命中 | `200` + 固定拒答文案，`refused=true` |
+| 生成层异常 | `200` + 检索原文，`degraded=true` |
+| 检索层异常 | `200` + 降级文案，`degraded=true` |
 
 ---
 
-## 已验证 / 未验证
+## 7. 评测
 
-**所有组件均已实跑验证**（chromadb 1.5.9 + sentence-transformers 6.1.0 + torch 2.14 + pypdf + beautifulsoup4 + jieba）：
+28 道题，26 题标注了"证据要点"（答案必须命中的事实），2 题负样本（问的是文档里**不存在**
+的信息，用来测拒答）。k=5。
 
-| 组件 | 实现 | 状态 |
-| --- | --- | --- |
-| 解析 .txt/.md/.docx/.pdf/.html | `parse.py` | ✅ 全部实测（含标题/分页锚点提取） |
-| 切块（父子块 + 字符偏移） | `split.py` | ✅ |
-| embedding | `HashingEmbedder` + `SentenceTransformerEmbedder`(bge-m3) | ✅ 都实测 |
-| 向量库 | `MemoryStore` + `ChromaStore`(HNSW) | ✅ 都实测，结果一致 |
-| 关键词检索 | `BM25Index`（jieba 分词生效） | ✅ |
-| 融合 / 重排 | RRF + Noop / Lexical / CrossEncoder(bge-reranker-v2-m3) | ✅ 都实测 |
-| 评测 | recall@k / MRR / NDCG / 证据@1 / 证据MRR | ✅ |
+**线上配置（hybrid + API 重排）**
 
-**唯一未验证**：`OpenAIEmbedder` 和 `OpenAICompatLLM`——它们需要的不是 pip 包，而是
-**API key + 一个真实或本地 LLM 服务**，本环境无法凭空验证。配置 `.env` 的 `LLM_API_KEY` 后即可用。
+| recall@5 | 证据召回 | 证据@1 | 证据 MRR | 来源 MRR | nDCG@5 |
+|---:|---:|---:|---:|---:|---:|
+| 0.929 | 1.000 | 0.846 | 0.910 | 0.815 | 0.845 |
 
-### 实测数据（20 题，k=5，chroma 后端）
+**关掉重排做召回消融**（`RERANKER=none`）
 
-**① 完整栈（bge-m3 embedding + bge-reranker 重排）**
+| mode | recall@5 | 证据召回 | 证据@1 | 证据 MRR | 来源 MRR | nDCG@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| hybrid | 0.893 | 1.000 | 0.731 | 0.849 | 0.714 | 0.761 |
+| bm25 | 0.929 | 0.923 | 0.731 | 0.811 | 0.789 | 0.824 |
+| vector | 0.893 | 1.000 | 0.615 | 0.795 | 0.708 | 0.756 |
 
-```
-mode          recall@5   证据召回   证据@1   证据MRR   来源MRR   ndcg
-vector/bm25/hybrid   0.950   1.000   1.000   1.000   0.925   0.933   （三模式相同）
-```
+三个结论（都来自这张表，不是常识转述）：
 
-**② 纯召回层（`RERANKER=none`，观察召回本身的差异）**
+1. **重排把证据@1 从 0.731 抬到 0.846，证据 MRR 从 0.849 抬到 0.910** ——
+   排序质量确实是重排在赚。
+2. **两路召回互补，但互补点不在同一层**：不重排时 bm25 的证据@1（0.731）明显好于
+   vector（0.615），而 vector 的证据召回是满的（1.000）、bm25 只有 0.923 —— 一个排得准、
+   一个找得全。融合后 hybrid 拿到 1.000 的召回并把证据 MRR 拉到 0.849，但证据@1 仍与 bm25 持平，
+   说明**融合补的是"找得全"，"排得准"要交给重排**。所以做召回消融**必须关掉重排**，
+   否则重排会把两路的差异抹平。
+3. **术语型语料上 BM25 是强基线**：规程里全是"50 公里组""关门时间""强制装备"这种固定术语，
+   字面匹配比语义泛化更可靠。向量召回的短板在那种"换个说法问同一件事"的问题上才显现。
 
-```
-mode        recall@5   证据召回   证据@1   证据MRR   来源MRR   ndcg
-vector         0.908     1.000   0.947   0.974   0.867   0.865
-bm25           0.950     1.000   1.000   1.000   0.900   0.911
-hybrid         0.933     1.000   0.947   0.974   0.875   0.886
-```
-
-**③ 降级栈（hashing embedder + 词法重排，作对照）**：证据@1 = 0.895，证据MRR = 0.947。
-
-### 三个结论（都来自实测，后两条反直觉）
-
-1. **cross-encoder 重排带来真实收益**：证据@1 从 0.895 → 1.000、证据MRR 0.947 → 1.000。
-   那两道原本排到第 2 段的题，加真实重排后全部升到第 1 段。
-
-2. **cross-encoder 会把召回差异抹平**：②里三模式差异明显，①里三模式完全相同。
-   重排太强，无论候选来自哪一路召回，都能挑出真正相关的段落。因此
-   「装上语义模型后三模式差异就会显现」是错的——差异只在**关掉重排**时才可见。
-
-3. **BM25 在这个语料上比语义向量强**：②里 bm25 全面领先 vector，hybrid 居中。
-   原因是评测集几乎全是精确术语（型号、错误码、参数名、数字），BM25 词面匹配天然占优，
-   语义向量反而把「语义相似但术语不对」的段落（XR-1000 vs XR-2000 的相似表述）拉了进来。
-   **混合检索不是万能药**，价值取决于查询分布：精确术语多就偏 BM25，口语化/同义改写多就偏语义向量。
-
-### 工程数据
-
-- cross-encoder 重排 20 题（每题 30 候选 × 3 模式）：**CPU 约 10 分钟，GPU（RTX 4060）约 103 秒**。
-- 纯重排推理单次（30 候选，模型已加载）：**GPU 121 ms，CPU 1411 ms，约 11.6 倍**。
-  模型加载本身（读 2.2GB×2 权重到内存/显存）约 40 秒，与设备无关，是单次 search 的大头。
-- 磁盘占用：模型缓存 `.hf_cache` 约 **6.5 GB**，依赖 `.pylibs` 约 **1.3 GB**（CUDA 版 torch 另加约 2.6 GB）。
-- memory（精确）与 chroma（HNSW 近似）在 28 条向量上指标逐位一致，ANN 召回损失为零。
-
-### GPU 重排怎么开
-
-默认 `DEVICE=auto`，装上 CUDA 版 torch 就会自动用 GPU（`stats` 显示 `device: cuda:0`）。三步：
-
-```bash
-# 1) 把 CPU 版 torch 换成 CUDA 版（按需选 cu126 / cu124，对应 CUDA 12.x 驱动）
-pip install --target .pylibs --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
-
-# 2) 确认 GPU 可用
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-
-# 3) 无需改代码，auto 自动走 GPU；也可显式指定
-#    .env: DEVICE=cuda   （或 DEVICE=cpu 强制回退 CPU）
-```
-
-> 注意：CUDA 版 torch 的体积比 CPU 版大得多（本机实测约 2.6 GB），
-> 且必须与 NVIDIA 驱动兼容。本机 RTX 4060 + 驱动 591.59 + torch 2.14.1+cu126 实测通过。
-> 没 NVIDIA 显卡的机器装 CUDA 版 torch 是浪费，保持 CPU 版即可。
-
+> 换个语料就必须重跑。这些数字只对 `data/sports/` 这 8 篇、`eval/dataset-sports.jsonl` 这 28 题成立。
 
 ---
 
-## 可选依赖装在哪
+## 8. 配置
 
-不想污染共享 Python 运行时的话，装到工作区本地目录：
+全部集中在 `config.py`，通过 `.env` 覆盖。常用的：
 
-```bash
-pip install --target .pylibs chromadb sentence-transformers pypdf beautifulsoup4 jieba
-```
-
-> 上面装的是 CPU 版 torch（sentence-transformers 的默认依赖）。
-> 要 GPU 加速重排，见上文「GPU 重排怎么开」单独换 CUDA 版 torch。
-
-`cli.py` 启动时会自动把 `.pylibs` 追加到 `sys.path`，所以直接
-`python cli.py stats` 就能看到它生效，不需要设 `PYTHONPATH`。
-该目录已在 `.gitignore` 里。
-
-**模型下载走镜像**：`sentence-transformers` 首次运行会从 HuggingFace 下载模型
-（bge-m3 + bge-reranker-v2-m3 约 4.4GB）。官方 `huggingface.co` 不通时，在 `.env` 里设置：
-
-```
-HF_ENDPOINT=https://hf-mirror.com
-HF_HOME=E:\dsh workspace\.hf_cache     # 缓存在工作区内，便于复用
-```
-
-装完 chromadb 后注意：`STORE_BACKEND=auto` 会**自动从 memory 切到 chroma**，
-而新后端的集合是空的。程序会打印明确警告并提示重建，但重建仍然必须由你触发。
-
-### 怎么观察「召回层」本身的差异
-
-重排会把召回差异抹平，所以要看某一路召回到底有没有用，先关掉重排：
-
-```bash
-# Linux / macOS
-RERANKER=none python cli.py eval --compare -k 5
-# Windows PowerShell
-$env:RERANKER="none"; python cli.py eval --compare -k 5
-```
-
-这样三模式的分数才是**召回层**的真实差异（见上文实测数据 ②）。
-不加 `RERANKER=none` 时，看到的是「召回 + 重排」的最终效果（实测数据 ①）。
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `RAW_DIR` | `data/sports` | 语料目录 |
+| `STORE_BACKEND` | `auto` | `milvus` / `chroma` / `memory`，auto 按可用性降级 |
+| `RAG_MILVUS_URI` | `data/milvus.db` | 独立集群填 `http://127.0.0.1:19530` |
+| `EMBEDDER` | `auto` | `openai` 走 API；**`auto` 不会自动用 API**，见踩坑 |
+| `RERANKER` | `auto` | `api` 走接口；`none` 关掉（消融必须） |
+| `TOP_K_RECALL` / `TOP_K_FINAL` | 30 / 5 | 召回放宽，精度交给重排 |
+| `RRF_K` | 60 | RRF 平滑常数 |
+| `REDIS_URL` | — | 缓存与限流共用 |
+| `RAG_CACHE_TTL` / `RAG_CACHE_USER_TTL` | 300 / 60 | 公开答案 / 含个人信息的答案 |
+| `RAG_CACHE_ENCRYPT` | `true` | 缓存值 AES-GCM 加密后再进 Redis |
+| `RAG_RATE_LIMIT_PER_MIN` / `_BURST` | 20 / 5 | 按 userId 的令牌桶 |
+| `LLM_TIMEOUT` / `LLM_STREAM_TIMEOUT` / `LLM_DEADLINE` | 45 / 20 / 45 | 整体 / 单次读 / 整段墙钟 |
+| `RAG_SHARED_SECRET` | 空 | 内部验签密钥，留空=调试模式 |
 
 ---
 
-## 切换后端 / 模型
+## 9. 几个刻意的设计决定
 
-依赖装好后 `auto` 会自动切换，无需改代码。但切换后**必须重建索引**：
+### 为什么父块不进向量库
 
-```bash
-python cli.py ingest --rebuild
-```
+父块 1500 字，塞进向量库会让"一个块里什么都有"，相似度被平均掉；子块 500 字匹配准，
+但单独喂给模型又缺上下文。所以子块负责"被检索到"，父块负责"被读"。
 
-**不重建，程序会报警。** 索引目录里存了 `index_meta.json`，记录这份索引用什么后端、
-什么 embedding 模型建的；检测到与当前配置不一致时，`search` / `eval` / `stats` 都会打印
-明确的迁移提示。这个检查**不受 `-q` 影响**——它是正确性问题，不是日志噪音。
+### 为什么 RRF 而不是加权求和
 
-`stats` 命令会显示每个环节实际生效的实现：
+向量分数（余弦）和 BM25 分数（无界正数）不在一个量纲上，加权就得先归一化，而归一化本身
+会引入新的假设。RRF 只用名次：`1/(k+rank)`，两路各 60 名以内按名次融合，不需要调权重。
 
-```
-  embedder          : sentence-transformers
-  reranker          : cross-encoder
-  store             : chroma
-  llm               : echo
-```
+### 为什么重排走 API 而不是本地模型
 
-如果某项显示的还是降级实现，说明对应依赖没装上或导入失败，留意启动时的告警行。
+本地 bge-reranker-v2-m3 要拉 torch（约 4GB）并常驻显存，冷启动 40s+。这个项目
+embedding 和重排都已经走 API，服务启动预热 0.9s，部署不依赖 GPU。
 
----
+### 为什么私有数据不进向量库
 
-## 扩展点
+"我的报名"一旦切块入向量库，别人提问也可能把它检索出来。所以：userId 只从签名头来，
+用户数据由 Java 查库后以 `userFacts` 注入 prompt，并且 prompt 里明确规定"只能答本人的，
+问别人一律回'只能查询你本人的报名信息'"。
 
-按性价比排序：
+### 为什么缓存要加密
 
-1. **查询改写**（`rag/retrieve/`）。多查询扩展或 HyDE：先让 LLM 编一个假答案，
-   用它去检索。解决「问题」和「陈述」形态不一致的非对称检索问题。
-   在 `Retriever.search` 里对 `question` 做扩展，把多路结果一起塞进 `rankings` 即可。
-2. **评测集扩充。** 20 题只能做冒烟测试。真实项目至少 50–100 题，
-   而且要从**线上真实提问**里采样，不要自己编——自己编的题会不自觉地避开难点。
-3. **生成端指标**（RAGAS 的 faithfulness / answer relevancy）。
-   需要 LLM 当裁判，在 `rag/eval/metrics.py` 里加一个 `judge` 层即可，
-   骨架已经留了 `negative` 样本的挂点。
-4. **BM25 落盘。** 语料上规模后，把 `BM25Index` 序列化，避免每次启动重建。
-5. **流式输出。** `OpenAICompatLLM.chat` 改成 `stream=True` 逐块返回。
-6. **增量更新的内容比对。** 现在按 source 先删后加，文档没变也会重新向量化。
-   加上内容哈希可以跳过未变更的文档。
+Redis 里躺着的是"某个用户问了什么 + 答案"，含手机号、证件号脱敏片段。缓存值用
+AES-GCM（key 由 `RAG_CACHE_KEY` 经 HKDF 派生）加密后存，进 Redis 只能看到 `e1:` 前缀的密文。
+
+### 为什么两层限流
+
+网关层（OpenResty 令牌桶）保**全局总量**，应用层（Redis 按 userId 令牌桶）保
+**单用户公平**。只做一层的话，要么扛不住总量，要么一个人能把额度吃光。
 
 ---
 
-## 已知限制
+## 10. 踩坑记录
 
-- **没有并发与缓存。** 单进程同步实现，适合验证与轻量使用，不是服务端骨架。
-- **没有权限与多租户。** 检索不做任何访问控制，所有语料对所有人可见。
-- **`MemoryStore` 是精确检索，`ChromaStore` 是近似检索。** 原理上两者结果不会完全一致，
-  这是 HNSW 的召回损失。但在本项目规模（28 条向量）上实测指标完全相同，
-  语料上到几十万条以后才可能拉开差距。
-- **解析层很薄。** PDF 只做纯文本提取，不处理双栏、表格结构、扫描件 OCR。
-  真实场景建议换成 `unstructured` 或专门的版面分析模型——这一步决定 RAG 的天花板，
-  值得单独投入。
+- **`MILVUS_URI` 这个名字不能用**：pymilvus 把它当全局默认连接解析，设成本地文件路径会在
+  `import` 阶段直接抛 `ConnectionConfigException: Illegal uri`。项目里用 `RAG_MILVUS_URI`。
+- **`EMBEDDER=auto` 不会自动改用 API**：没装 sentence-transformers 时它静默退回内置
+  hashing embedder，检索质量悄悄掉一个档，而且日志里只有一行不起眼的提示。纯 API 模式必须显式写 `openai`。
+- **Redis 用 Lua 时**：老版本（3.2）`HSET` 的 arity 是 4，一次写两个 field 会报
+  `Wrong number of args`；脚本里先调了 `TIME` 再写 Redis 会报
+  `Write commands not allowed after non deterministic commands`，必须加 `redis.replicate_commands()`。
+- **`python -c "..."` 在 PowerShell 里是引号地狱**：脚本里带 `redis.call(...)` 时参数会被截断，
+  一律写成临时 `.py` 再跑。
+- **milvus-lite 是单进程独占的**：db 文件被占用时另一个进程打不开（Windows 下 `WinError 5`）。
+  多实例共享必须用独立 Milvus（就是 compose 里那个）。
+
+---
+
+## 11. 已知限制
+
+1. **检索内核本身没有并发**：`pipeline` 是同步的，重排走 HTTP，单次 2~3s。要扛并发得靠多进程/多实例。
+2. **语料是手工维护的 8 篇**，没有增量同步；换一版规程要重跑 `ingest --rebuild`。
+3. **限流只有应用层这一层**（网关那层在另一个仓库的 Nginx 配置里），单实例部署时它就是全部。
+4. **生成超时只能断，不能续**：墙钟到点直接切，已生成的文本会保留并标记 `error`。
+5. **评测集只有 28 题**，负样本 2 题，统计意义有限；指标变化小于 0.02 时不要当作改进。
+6. **拒答判定是关键词启发式**（`_looks_refused`），模型说"我无法回答"的变体可能漏判。
+
+---
+
+## 12. 与 Java 主链路的关系
+
+| 场景 | 走哪边 |
+|---|---|
+| "50 公里组要带头灯吗" | 本服务（规程检索） |
+| "半马报名费多少" | 本服务（组别信息来自规程文档） |
+| "我报名成功了吗" | 本服务 + `userFacts`（数据由 Java 查库注入） |
+| "还剩几个名额" | **Java 直接查 Redis 余量**，不进本服务（余量是秒级变化的结构化事实） |
+| "帮我取消报名" | Java（写操作，需要鉴权与幂等） |
+
+这条边界的意义：让大模型只处理"自然语言的规则解释"，把"结构化事实"和"写操作"留在
+确定性的代码里。助手可以挂，报名不能挂。
