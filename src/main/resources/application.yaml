@@ -1,0 +1,68 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: hmdp-plus-rag
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DB:hmdp_plus}?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8&rewriteBatchedStatements=true
+    username: ${MYSQL_USER:root}
+    # 本地默认值仅为开箱即跑；部署时用环境变量覆盖，别把真实口令写进仓库
+    password: ${MYSQL_PASSWORD:wp123456}
+  redis:
+    host: ${REDIS_HOST:127.0.0.1}
+    port: ${REDIS_PORT:6379}
+    # password: your_redis_password
+    lettuce:
+      pool:
+        max-active: 20
+        max-idle: 20
+        min-idle: 2
+        time-between-eviction-runs: 10s
+  jackson:
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity
+  configuration:
+    map-underscore-to-camel-case: true
+
+# ===== RocketMQ =====
+rocketmq:
+  name-server: ${ROCKETMQ_NAME_SERVER:127.0.0.1:9876}
+
+# ===== 报名链路 =====
+registration:
+  # 未支付自动关单阈值（分钟），需与对账任务保持一致
+  timeout-minutes: 15
+  # RocketMQ 延迟档位：默认 18 档中 14=10m、15=20m。
+  # 若要精确 15 分钟，需在 broker.conf 自定义 messageDelayLevel；
+  # 这里默认 14（10 分钟）+ 对账兜底，避免对外口径与 broker 配置不一致。
+  delay-level: 14
+  rate-limit:
+    sliding-window:
+      enabled: true
+      window-ms: 1000
+      max-requests: 5
+
+# ===== 赛事助手（RAG）=====
+# 旁路服务：Python 侧跑在 8090，Java 只做转发与降级。
+# 起不来也不影响报名主链路 —— RagClient 任何异常都返回 degraded=true 的结果。
+assistant:
+  rag:
+    enabled: true
+    base-url: ${RAG_BASE_URL:http://127.0.0.1:8090}
+    # 同机部署，连不上基本就是没起，500ms 足够
+    connect-timeout-ms: 500
+    # 检索 + 重排 + 生成三段串行，线上 P99 约 2~3s，留足余量
+    read-timeout-ms: 8000
+    # 流式要等模型逐字吐完，读超时必须比非流式宽
+    stream-timeout-ms: 60000
+    # 内部调用签名密钥，必须与 Python 侧 .env 的 RAG_SHARED_SECRET 一致。
+    # 作用：让 Python 相信「userId 是 Java 会话给的」，浏览器无法伪造。
+    shared-secret: ${RAG_SHARED_SECRET:yejing-rag-2026-local-dev}
+
+logging:
+  level:
+    com.hmdp: debug
