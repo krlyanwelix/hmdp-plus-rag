@@ -3,8 +3,6 @@
 把「黑马点评」的本地生活场景整体换成**体育赛事报名**，只保留三条真正有价值的链路，
 其余（探店/笔记/点赞/关注/签到/Feed/UV）全部删除。
 
-改造的原则是：**每条技术点都必须能回答"不这么做会出什么事故"**，答不上来的就删。
-
 ---
 
 ## 〇、仓库结构
@@ -92,46 +90,7 @@ OpenResty lua_shared_dict ──→ Caffeine(10_000, expireAfterWrite 10min)
 
 ---
 
-## 二、和 hmdp-pro 的差异
-
-### 删掉的（未采用的）
-
-| 删除项 | 原因 |
-|---|---|
-| 探店/笔记/点赞/关注/Feed/签到/UV/Geo | 与赛事报名无关的"黑马套餐"，留着只会稀释故事 |
-| Redis Stream 消费（`stream.orders`、`handlePendingList`） | 已被 RocketMQ 替代，两套并存是负担 |
-| A/B 双写策略（`seckill.mode`）、`seckill-claim.lua` | 实验开关，对真实链路没有价值 |
-| `seckill:test:protection`（FULL/HEIMA/EARLY） | 同上，属于"演示对比"而非工程实现 |
-| `SimpleRedisLock` / `ILock` / `unlock.lua` | 已统一用 Redisson，自研锁是死代码 |
-| `PasswordEncoder`（盐+MD5） | 验证码登录用不到，且 MD5 本身不该出现 |
-| 压测对照接口 `/shop/benchmark/*` | 换成真实业务接口，不再为演示留后门 |
-| `hmdp.sql`（GBK） | 重新写了 utf8mb4 的 `db/schema.sql` + `db/data.sql` |
-| spring-data-redis 的 2.7.0 版本钉子 | 不再用 Stream API，无需强行拔高，避免 Spring 5.2/5.3 错配 |
-
-### 改掉的（修 hmdp-pro 的缺陷）
-
-| 原问题 | 修法 |
-|---|---|
-| `createOrderFromMQ` 无事务，扣库存成功但 save 失败会导致 MQ 重试双扣 | 落库整体进 `@Transactional`（`persist`），扣减与插入同生共死 |
-| 多级缓存 `queryWithMutexLock` 的 finally 无条件 unlock，会删掉别人的锁 | 只有 `setIfAbsent` 成功、且校验 token 一致时才释放；未抢到锁的分支完全不碰锁 |
-| `LOGIN_USER_TTL = 36000` 但单位是 MINUTES（=25 天） | 改成 30 分钟 |
-| 方案 A 中 `sendStatus != OK` 但 Lua 已执行 → 报失败却扣了库存 | `luaResult == -1` 返回"受理中 + 报名号"，不报失败；配 `reg:pending` 反查 |
-| OpenResty `body_filter_by_lua_block` 未判 eof，大响应被截断 | `if not ngx.arg[2] then 回写 end`，只处理最后一块 |
-| 对账依赖 `initial_stock` 但没有回填 SQL | 建表即写入 `initial_quota`，并让 `QuotaInitializer` 在启动时播种 Redis |
-| `seckill.lua` 里 `EX 3600` 与常量重复硬编码 | TTL 由 `ARGV[2]` 传入 |
-| Redis 地址在 yaml 与 RedissonConfig 两处硬编码 | 统一读 `spring.redis.*` |
-| 一人一单只靠 Redis Set + 唯一索引 `(user_id, voucher_id)` | 改成 `(event_id, athlete_id, active_flag)`：退赛后可以重报，历史单留痕 |
-
-### 新增的
-
-- `tb_athlete`（实名档案）：鉴权不再只是"登录了"，而是"具不具备这个组别的准入资格"。
-- `active_flag` + 三列唯一索引。
-- `reg:pending` 受理中标记，解决 UNKNOW 分支"用户拿不到单号"。
-- `QuotaInitializer`：启动时 `setIfAbsent` 播种余量（不覆盖运行中的值）。
-
----
-
-## 三、目录结构
+## 二、目录结构
 
 ```
 hmdp-plus-rag
@@ -159,7 +118,7 @@ hmdp-plus-rag
 
 ---
 
-## 四、跑起来
+## 三、跑起来
 
 ### 前置
 
@@ -249,16 +208,11 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 
 ## 五、已知限制
 
-诚实列出来，比藏起来强：
-
 1. **支付是假的**：`pay` 只做状态流转，没有对接支付渠道，也没有异步回调与对账。
 2. **Canal 链路未联调**：消费者代码就绪，但没接真实 Canal Server；单机部署时"写后删缓存"已够用。
-3. **延迟消息档位不精确**：RocketMQ 4.x 默认 18 档，14=10 分钟、15=20 分钟。想要精确 15 分钟得改
-   `messageDelayLevel`，所以默认 `delay-level: 14` + 对账兜底，而不是假装做到了 15 分钟。
-4. **对账是单机串行**：Redisson 锁保证只有一个实例在跑，代价是数据量大时一轮扫不完；
+3. **对账是单机串行**：Redisson 锁保证只有一个实例在跑，代价是数据量大时一轮扫不完；
    生产上应按 event_id 分片并发。
-5. **RAG 未实现**：只留了接入点与设计（见 `docs/rag-extension.md`）。
-6. **没有压测数据**：本机没有 JMeter 环境的跑分一律不写进 README，避免出现无法复现的数字。
+4. **没有压测数据**：本机没有 JMeter 环境的跑分一律不写进 README，避免出现无法复现的数字。
 7. **`quota:group:{id}` 是唯一真相之外的第二份账**：Lua 里 `GET` 到 nil 会直接判"名额已满"，
    而 `QuotaInitializer` 只在启动时用 `setIfAbsent` 播种。手工 `DEL` 掉这个 key 必须重启应用
    或重新 `SET`，否则该组别会一直显示售罄。生产上应由"对账重算"覆盖这个场景（当前重算只处理已结束的组别）。
@@ -280,7 +234,7 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 
 ---
 
-## 七、实测验证（本机跑通，不是纸面设计）
+## 七、实测验证
 
 环境：JDK 8 / MySQL 8.0 / Redis（本机 6379）/ RocketMQ 4.9.7（NameServer + Broker 单机）+ 应用 8081。
 
@@ -294,15 +248,6 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
 | 6 | 重复报名 | 持有效单时再报同一赛事 | 返回「您在本赛事已有报名，请勿重复提交」（Lua 第 2 步 `SISMEMBER` 拦截） |
 | 7 | DB/Redis 对账 | 对账任务跑完一轮后比对 | DB `quota=2999` = Redis `2999` = `initial_quota 3000 − 1 张有效单` |
 | 8 | 滑动窗口限流 | 1 秒内对 `/registration/**` 连打 6 次 | 第 6 次返回「操作过于频繁，请稍后再试」 |
-
-### 跑的过程中修掉的两个真 bug
-
-1. **`active_flag` 用 0 表示失效会撞唯一索引**。第一次退赛后，同一证件再退一次就抛
-   `DuplicateKeyException`，接口返回「服务器异常」。原因是 `uk_event_athlete_active(event_id, athlete_id, active_flag)`
-   对 `0` 去重。改成 `NULL` 后，MySQL 唯一索引不把多个 `NULL` 当重复，历史失效单可以无限留痕。
-   ——这是实测踩出来的，光看设计推演发现不了。
-2. **落库成功后没删 `reg:pending:{userId}:{eventId}`**。补单段每分钟会把这个已经成功的单再捞出来重投一次
-   （虽然靠 `getById` 幂等不会重复建单，但白白刷日志和 MQ）。现在在 `createFromMQ` 成功分支里删除。
 
 ---
 
@@ -425,7 +370,7 @@ Python 侧（`rag/.env`）：
 | bm25（不重排） | 0.929 | 1.000 | 0.808 | 0.878 | 0.789 | 0.824 |
 | vector（不重排） | 0.893 | 1.000 | 0.769 | 0.885 | 0.708 | 0.756 |
 
-三个结论（都是自己跑出来的，不是抄的）：
+三个结论：
 
 1. **重排确实值钱**：证据@1 从 0.769 拉到 0.846，ndcg 从 0.776 拉到 0.845。
 2. **重排会抹平召回差异**：不重排时 bm25 的证据@1（0.808）明显高于 vector（0.769），
@@ -444,8 +389,3 @@ Python 侧（`rag/.env`）：
 4. **超时只能"断"，不能"续"**。`LLM_DEADLINE` 到点就切断并兜原文，已经生成的部分不会续写；
    要续写得引入会话/草稿，成本远大于收益。
 5. **语料是手工整理的**。真实场景要从赛事管理系统导出 + 人工校对，解析质量决定 RAG 天花板。
-6. **milvus-lite 是单进程独占的**。同一个 `data/milvus.db` 不能被两个 Python 进程同时打开
-   （`DataDirLockedError`），所以"跨实例缓存"要验证只能用 chroma/memory 后端，或者把 Milvus
-   独立部署成服务（`RAG_MILVUS_URI=http://127.0.0.1:19530`）。横向扩容时这一点必须先解决。
-
-
