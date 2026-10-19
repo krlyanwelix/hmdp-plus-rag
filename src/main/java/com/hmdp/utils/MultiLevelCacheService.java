@@ -22,8 +22,8 @@ import java.util.function.Function;
  * <p>
  * 三个设计点：
  * <ol>
- *   <li><b>逻辑过期而非物理过期</b>：key 不过期，过期时间写在 value 里。命中过期数据时
- *       返回旧值并异步重建，请求不会被阻塞，也不会同时打穿到 DB。</li>
+ *   <li><b>逻辑过期而非物理过期</b>：过期时间写在 value 里，读到过期数据时返回旧值并异步重建，
+ *       请求不会被阻塞，也不会同时打穿到 DB；Redis 侧另给一个更长的物理 TTL 兜底回收。</li>
  *   <li><b>重建互斥</b>：只有抢到 {@code lock:event:{id}} 的线程去重建，其余线程直接拿旧值。
  *       锁只在抢到它、且确实要重建时释放，未抢到锁的分支绝不触碰锁。</li>
  *   <li><b>空值占位</b>：DB 查不到也写一个短 TTL 的空串，防止"查不存在的赛事"反复穿透。</li>
@@ -40,6 +40,12 @@ public class MultiLevelCacheService {
     private Cache<String, Object> localCache;
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    /**
+     * 物理 TTL 比逻辑过期多留的时间。
+     * 逻辑过期后还有一段时间可以读到旧值、异步重建；物理 TTL 只是最后的回收兜底。
+     */
+    private static final long PHYSICAL_TTL_GRACE_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
     /**
      * 读缓存，未命中则回源。
@@ -187,14 +193,24 @@ public class MultiLevelCacheService {
     /**
      * 写缓存，逻辑过期时间带 ±20% 抖动。
      * 抖动的作用是让同一批 key 的失效时间错开，避免整点同时重建。
+     *
+     * <p>注意还要给 Redis 一个**物理 TTL**（比逻辑过期晚 10 分钟）：
+     * 逻辑过期只影响读路径（读到过期就异步重建），物理 TTL 才是兜底回收。
+     * 只写逻辑过期不给物理 TTL 的话，上游 Canal 挂了、某个 key 再没人读，
+     * 这条记录就永远不会被回收。
      */
     public void saveWithLogicalExpire(String key, Object value, Long time, TimeUnit unit) {
         long baseMillis = unit.toMillis(time);
         long jitter = (long) (baseMillis * (ThreadLocalRandom.current().nextDouble() * 0.4 - 0.2));
+        long logicalMillis = baseMillis + jitter;
         RedisData redisData = new RedisData();
         redisData.setData(value);
-        redisData.setExpireTime(LocalDateTime.now().plusNanos((baseMillis + jitter) * 1_000_000L));
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+        redisData.setExpireTime(LocalDateTime.now().plusNanos(logicalMillis * 1_000_000L));
+        stringRedisTemplate.opsForValue().set(
+                key,
+                JSONUtil.toJsonStr(redisData),
+                logicalMillis + PHYSICAL_TTL_GRACE_MILLIS,
+                TimeUnit.MILLISECONDS);
         localCache.put(key, redisData);
     }
 

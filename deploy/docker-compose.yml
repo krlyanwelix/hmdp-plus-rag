@@ -4,13 +4,14 @@
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #   docker compose -f deploy/docker-compose.yml logs -f app
 #
-# 起来的六个容器：
-#   app      Spring Boot 应用       8081
-#   mysql    MySQL 8.0              3306   （首次启动自动建库 + 导入 schema/data）
-#   redis    Redis                  6379   （登录态、名额余量、缓存）
-#   namesrv  RocketMQ NameServer    9876
-#   broker   RocketMQ Broker        10911 / 10909
-#   canal    Canal Server           11111  （binlog -> cache:event:{id} 失效）
+# 起来的六个常驻容器 + 一个一次性初始化容器：
+#   app        Spring Boot 应用       8081
+#   mysql      MySQL 8.0              3306   （首次启动自动建库 + 导入 schema/data）
+#   redis      Redis                  6379   （登录态、名额余量、缓存）
+#   namesrv    RocketMQ NameServer    9876
+#   broker     RocketMQ Broker        10911 / 10909
+#   canal      Canal Server           11111  （binlog -> cache:event:{id} 失效）
+#   topic-init 预建 topic 后退出（消费者必须比 topic 晚启动，否则订阅不上）
 #
 # 旁边的赛事助手是另一条命令：
 #   docker compose -f rag/deploy/docker-compose.yml up -d
@@ -108,6 +109,32 @@ services:
       retries: 30
       start_period: 20s
 
+  # 一次性的 topic 预建。
+  # 为什么需要：PushConsumer 在 topic 还不存在时启动，订阅不会生效，
+  # 消息会一直堆在队列里，直到下次重启应用才被消费（实测踩过：报名接口返回了
+  # 报名号、Redis 余量也扣了，DB 里却查不到单）。这里先把两个 topic 建出来。
+  topic-init:
+    image: apache/rocketmq:4.9.7
+    container_name: yejing-topic-init
+    restart: "no"
+    depends_on:
+      broker:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        cd /home/rocketmq/rocketmq-4.9.7/bin
+        for t in registration-topic canal-binlog-topic; do
+          i=0
+          until sh mqadmin updateTopic -n namesrv:9876 -c DefaultCluster -t "$$t" >/dev/null 2>&1; do
+            i=$$((i+1))
+            [ $$i -ge 30 ] && { echo "[topic-init] $$t 建不出来"; exit 1; }
+            sleep 2
+          done
+          echo "[topic-init] $$t ok"
+        done
+
   # ---------------------------------------------------------------- binlog 失效
   canal:
     image: canal/canal-server:latest
@@ -126,6 +153,8 @@ services:
         condition: service_healthy
       broker:
         condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
 
   # ---------------------------------------------------------------- 应用
   app:
@@ -159,6 +188,8 @@ services:
         condition: service_healthy
       broker:
         condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
       canal:
         condition: service_started
 

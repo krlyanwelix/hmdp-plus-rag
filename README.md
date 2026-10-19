@@ -132,8 +132,8 @@ docker compose -f rag/deploy/docker-compose.yml up -d --build
 
 | 命令 | 起什么 | 端口 |
 |---|---|---|
-| 主链路 | `app` / `mysql` / `redis` / `namesrv` / `broker` / `canal` | 8081 / 3306 / 6379 / 9876 / 10911 / 11111 |
-| 助手 | `rag-app` / `rag-redis` / `milvus` | 8090 / 6380 / 19530 |
+| 主链路 | `app` / `mysql` / `redis` / `namesrv` / `broker` / `topic-init`（一次性）/ `canal` | 8081 / 3306 / 6379 / 9876 / 10911 / 11111 |
+| 助手 | `rag-app` / `rag-redis` / `milvus` | 8090 / 6380 / 19530 / 9091 |
 
 两个 compose 彼此独立：助手挂了只影响问答，报名支付照常（Java 侧会降级）。
 
@@ -301,7 +301,9 @@ powershell -ExecutionPolicy Bypass -File docs/smoke-test.ps1 -Token <token>
    而 `QuotaInitializer` 只在启动时用 `setIfAbsent` 播种。手工 `DEL` 掉这个 key 必须重启应用
    或重新 `SET`，否则该组别会一直显示售罄。生产上应由"对账重算"覆盖这个场景（当前重算只处理已结束的组别）。
 8. **消费者启动早于 topic 创建时会静默空转**：客户端要等 30s 一轮的路由刷新才会订阅上，
-   期间报名会停在 `PROCESSING`，靠对账补单收敛。部署时先建 topic 可以消掉这个窗口。
+   期间报名会停在 `PROCESSING`，靠对账补单收敛。compose 里加了 `topic-init` 一次性容器
+   先把两个 topic 建出来、`app` 等它跑完再启动，所以容器编排下没有这个窗口；
+   手工分步启动时仍要自己先 `mqadmin updateTopic`（见 2.1）。
 
 ---
 
