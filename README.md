@@ -7,6 +7,25 @@
 
 ---
 
+## 〇、仓库结构
+
+| 目录 | 内容 | 技术栈 |
+|---|---|---|
+| 根目录 | **赛事报名主链路**：名额预占、报名单状态机、名额对账、读路径缓存与限流 | Spring Boot 2.3 / MyBatis-Plus / RocketMQ / Redis / Redisson |
+| `rag/` | **赛事助手**：规程检索与问答（独立进程，可单独部署） | Python 3.12 / FastAPI / Milvus / Redis / bge-m3 |
+
+两者只通过 HTTP 对接：
+
+```
+浏览器 ──► 主链路 :8081 ──/assistant/ask──────────────► 赛事助手 :8090 /v1/ask
+                       ──/assistant/ask/stream(SSE)──►            /v1/ask/stream
+```
+
+**助手是旁路**：Python 侧没起或超时，主链路 600ms 内降级为"助手暂时不可用，
+报名与支付不受影响"，报名链路照常。细节见 [`rag/README.md`](rag/README.md)。
+
+---
+
 ## 一、三条链路
 
 ### 1. 写路径：RocketMQ 事务消息 + Redis Lua 原子预占
